@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 518;
+    constexpr int kBuildNo = 520;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -2266,6 +2266,10 @@ namespace {
     static unsigned s_v487Pause = 0;
     /* v483: capped clump readout (see LogClumps). */
     static unsigned s_v483Clump = 0;
+    /* v519: how often the tool tier was lifted (logged a few times). */
+    static unsigned s_v519Tier = 0;
+    /* v520: capped clump health readout around one nine-tile pass. */
+    static unsigned s_v520Clump = 0;
     /* v484: capped scythe/crop readout. */
     static unsigned s_v484Seen = 0;
     static unsigned s_v484Crop = 0;
@@ -17900,6 +17904,160 @@ namespace {
         }
     }
 
+    /* v519: the tool tier gate.
+     *
+     * ResourceClump.performToolAction (0x1B1F7A0) decides whether the tool is
+     * good enough with
+     *
+     *     ldr x8,[t,#0xe0]        ; Tool.upgradeLevel (NetInt)
+     *     ldr w8,[x8,#0x68]       ; the number itself
+     *     cmp w8,#1 / #2          ; per-clump minimum
+     *     b.le <message + return false>
+     *
+     * so a big stump or log with the starting axe, or a boulder / meteorite
+     * with the starting pickaxe, takes no damage at all no matter who swings.
+     * The tractor hands the game whatever tool the player carries, so it
+     * inherited that rule.  v519 lifts the level for the duration of one
+     * nine-tile swing and puts it straight back: the save still stores the
+     * real level, and swinging by hand (off the tractor) stays vanilla.
+     *
+     * The same function also scales clump damage by 0.75 * (level + 1), so the
+     * lifted level additionally opens a 2x2 clump in fewer swings. */
+    constexpr unsigned kToolUpgradeOff = SDV_OFF(kToolUpgradeOff, 0xE0u);
+    constexpr int kTractorToolLevel = 4;  /* iridium */
+
+    bool ToolLevelGet(void* tool, int* out) {
+        if (tool == nullptr || !Plausible(tool)) {
+            return false;
+        }
+        if (!RangeReadable(static_cast<char*>(tool) + kToolUpgradeOff,
+                           sizeof(void*))) {
+            return false;
+        }
+        void* ref = *reinterpret_cast<void**>(
+            static_cast<char*>(tool) + kToolUpgradeOff);
+        if (ref == nullptr || !Plausible(ref)) {
+            return false;
+        }
+        if (!RangeReadable(static_cast<char*>(ref) + kNetValueOff2,
+                           sizeof(int))) {
+            return false;
+        }
+        if (out != nullptr) {
+            *out = *reinterpret_cast<int*>(
+                static_cast<char*>(ref) + kNetValueOff2);
+        }
+        return true;
+    }
+
+    /* v520: write through the game's own setter (Tool.set_UpgradeLevel,
+     * 0x1B3C5C0 -> NetInt.set_Value) instead of poking +0x68.  Same field, but
+     * the NetInt is marked dirty the way the engine expects. */
+    constexpr uintptr_t kToolSetUpgradeOff =
+        SDV_OFF(kToolSetUpgradeOff, 0x1B3C5C0u);
+
+    void ToolLevelSet(void* tool, int level) {
+        if (tool == nullptr || !Plausible(tool)) {
+            return;
+        }
+        if (!RangeReadable(static_cast<char*>(tool) + kToolUpgradeOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* ref = *reinterpret_cast<void**>(
+            static_cast<char*>(tool) + kToolUpgradeOff);
+        if (ref == nullptr || !Plausible(ref)) {
+            return;
+        }
+        reinterpret_cast<void (*)(void*, int)>(g_base + kToolSetUpgradeOff)(
+            tool, level);
+    }
+
+    /* v520: axe or pickaxe by ITEM ID, not by the DoFunction row lookup.
+     * v519 keyed the level lift and the whole clump pass on `toolRow`, which is
+     * resolved by matching DoFunction against known bodies; if that match ever
+     * misses, both switch off silently.  The item id cannot miss. */
+    bool ToolIsAxeOrPick(void* tool) {
+        if (tool == nullptr || !Plausible(tool)) {
+            return false;
+        }
+        void* id = reinterpret_cast<void* (*)(void*)>(g_base + kGetItemIdOff)(tool);
+        if (id == nullptr || !Plausible(id)) {
+            return false;
+        }
+        return NameEquals(id, "Axe") || NameEquals(id, "Pickaxe") ||
+               NameEquals(id, "(T)Axe") || NameEquals(id, "(T)Pickaxe");
+    }
+
+    /* v520 diagnostic: what the clump under the tractor looks like before and
+     * after one nine-tile pass.  If the lifted level really reached the game,
+     * health goes down here; a refusal leaves it untouched. */
+    void LogClumpHealth(void* here, int tx, int ty, const char* tag) {
+        if (here == nullptr || !Plausible(here) || s_v520Clump >= 12u) {
+            return;
+        }
+        if (!RangeReadable(static_cast<char*>(here) + kResourceClumpsOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* nc = *reinterpret_cast<void**>(
+            static_cast<char*>(here) + kResourceClumpsOff);
+        if (nc == nullptr || !Plausible(nc) ||
+            !RangeReadable(static_cast<char*>(nc) + kNetDictInnerOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* list = *reinterpret_cast<void**>(
+            static_cast<char*>(nc) + kNetDictInnerOff);
+        void** items = nullptr;
+        int count = 0;
+        if (!ReadListRaw(list, &items, &count)) {
+            return;
+        }
+        for (int i = 0; i < count && i < 64 && s_v520Clump < 12u; ++i) {
+            void* c = items[i];
+            if (c == nullptr || !Plausible(c)) {
+                continue;
+            }
+            void* boxFn = VSlot(c, kTfBoxSlotOff);
+            if (boxFn == nullptr) {
+                continue;
+            }
+            const Rect4i r = reinterpret_cast<Rect4i (*)(void*)>(boxFn)(c);
+            bool inside = false;
+            for (int dy = -kTractorRadius; dy <= kTractorRadius && !inside; ++dy) {
+                for (int dx = -kTractorRadius; dx <= kTractorRadius && !inside; ++dx) {
+                    const int px = (tx + dx) * 64;
+                    const int py = (ty + dy) * 64;
+                    inside = r.x < px + 64 && px < r.x + r.w &&
+                             r.y < py + 64 && py < r.y + r.h;
+                }
+            }
+            if (!inside) {
+                continue;
+            }
+            int idx = -1;
+            float hp = -1.0f;
+            if (RangeReadable(static_cast<char*>(c) + kClumpIndexOff, sizeof(void*))) {
+                void* ir = *reinterpret_cast<void**>(static_cast<char*>(c) + kClumpIndexOff);
+                if (ir != nullptr && Plausible(ir) &&
+                    RangeReadable(static_cast<char*>(ir) + kNetValueOff2, 4u)) {
+                    idx = *reinterpret_cast<int*>(static_cast<char*>(ir) + kNetValueOff2);
+                }
+            }
+            if (RangeReadable(static_cast<char*>(c) + kClumpHealthOff, sizeof(void*))) {
+                void* hr = *reinterpret_cast<void**>(static_cast<char*>(c) + kClumpHealthOff);
+                if (hr != nullptr && Plausible(hr) &&
+                    RangeReadable(static_cast<char*>(hr) + kNetValueOff2, 4u)) {
+                    hp = *reinterpret_cast<float*>(static_cast<char*>(hr) + kNetValueOff2);
+                }
+            }
+            ++s_v520Clump;
+            LOGF("v520 clump %s idx=%d hp=%d.%d t=%d,%d", tag, idx,
+                 static_cast<int>(hp), static_cast<int>(hp * 10) % 10, tx, ty);
+        }
+    }
+
     /* v483 diagnostic: which resource clumps sit under the tractor and how much
      * health they have left.  Logged only for the first few swings, so a test
      * that still refuses to chop a log says why (wrong index, health not
@@ -19752,7 +19910,8 @@ namespace {
                  * is set first because the clump hands the tool back to
                  * getLastFarmerToUse() for professions and drops. */
                 const bool clumpTool =
-                    toolRow == kRowAxe || toolRow == kRowPick;
+                    toolRow == kRowAxe || toolRow == kRowPick ||
+                    ToolIsAxeOrPick(tool);
                 /* v483: clumps are NOT reached from DoFunction in this build.
                  * Axe.DoFunction only does objects, terrainFeatures and
                  * largeTerrainFeatures (it calls GameLocation.get_Objects but
@@ -19772,6 +19931,32 @@ namespace {
                         static_cast<char*>(tool) + kToolLastUserOff) = pl;
                     LogClumps(here, tool, tx, ty);
                 }
+                /* v520: lift the level for whatever goes through this
+                 * nine-tile path.  The hoe, the watering can and melee weapons
+                 * never get here (their own branches above), so this is the
+                 * axe and the pickaxe -- the only tools with a tier gate.  It
+                 * is deliberately NOT keyed on toolRow any more: one bad row
+                 * lookup used to switch the lift and the clump pass off
+                 * together. */
+                int savedToolLevel = 0;
+                bool toolLevelBumped = false;
+                int levelBefore = -1;
+                if (ToolLevelGet(tool, &levelBefore) && levelBefore >= 0) {
+                    if (levelBefore < kTractorToolLevel) {
+                        savedToolLevel = levelBefore;
+                        ToolLevelSet(tool, kTractorToolLevel);
+                        toolLevelBumped = true;
+                    }
+                    if (s_v519Tier < 6u) {
+                        ++s_v519Tier;
+                        int readback = -1;
+                        (void)ToolLevelGet(tool, &readback);
+                        LOGF("v520 tier pre=%d read=%d row=%d axepick=%d dofn=%p",
+                             levelBefore, readback, toolRow,
+                             ToolIsAxeOrPick(tool) ? 1 : 0, doFunction);
+                    }
+                }
+                LogClumpHealth(here, tx, ty, "pre");
                 bool first = true;
                 for (int dy = -kTractorRadius; dy <= kTractorRadius; ++dy) {
                     for (int dx = -kTractorRadius; dx <= kTractorRadius; ++dx) {
@@ -19832,7 +20017,11 @@ namespace {
                         first = false;
                     }
                 }
+                LogClumpHealth(here, tx, ty, "post");
                 *sounds = savedSounds;
+                if (toolLevelBumped) {
+                    ToolLevelSet(tool, savedToolLevel);
+                }
                 /* v396: no stamina cost at all.  Each of the nine DoFunctions
                  * deducts its own (2*power - FarmingLevel*0.1), so the balance
                  * is simply put back.  v274 charged one swing instead of nine;
