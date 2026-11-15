@@ -19225,6 +19225,7 @@ namespace {
      * the update hook calls it, and it must stay out of the draw path: see the
      * comment on the definition. */
     void BuildHudStrings();
+    void BuildTileLabels();
     void SampleDate();
     void RunWeatherProbe();
     void PollDayBoundary();
@@ -19317,6 +19318,15 @@ namespace {
                 RunWeatherProbe();
             }
             BuildHudStrings();
+        }
+        /* v486: the crop and machine bubbles are built here, outside the
+         * 左上角信息 gate and outside BuildHudStrings(), because they have
+         * their own switch (作物/机器提示).  v468 gave them their own entry
+         * point for exactly this reason, but left the only call inside the
+         * g_hudOn block, so turning the HUD off still took both bubbles with
+         * it.  Everything BuildTileLabels() reads is its own state. */
+        if (kHudInfo) {
+            BuildTileLabels();
         }
         /* Probe A (one shot, never retried): allocate and construct a
          * StartupPreferences, read its +0x50, then drop the reference.
@@ -22134,8 +22144,12 @@ namespace {
         if (!kHudInfo) {
             return;
         }
-        /* The tile bubbles have their own switch; see BuildTileLabels. */
-        BuildTileLabels();
+        /* v486: the tile bubbles are NOT built here any more.  They used to sit
+         * at the end of this function, which returns early when 左上角信息 is
+         * off -- so switching the HUD block off silently killed the crop and
+         * machine bubbles too, even though 作物/机器提示 was still on.  They
+         * are world-space labels with their own switch, so the update hook now
+         * calls BuildTileLabels() outside this function entirely. */
         if (g_hudOn == 0) {
             return;
         }
