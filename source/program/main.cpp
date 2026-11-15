@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 482;
+    constexpr int kBuildNo = 494;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -2262,6 +2262,8 @@ namespace {
     static unsigned s_v482Tree = 0;
     static unsigned s_v482Bush = 0;
     static unsigned s_v482Pickup = 0;
+    /* v488: proof that the "menu open" pause actually fired (capped). */
+    static unsigned s_v487Pause = 0;
     /* v483: capped clump readout (see LogClumps). */
     static unsigned s_v483Clump = 0;
     /* v484: capped scythe/crop readout. */
@@ -2307,6 +2309,9 @@ namespace {
      * still not propagating; regMachines = 0 means the harvest hook is not
      * firing at all. */
     static unsigned s_autoGroups = 0;
+    /* v489: how many products went into a chest that already held that item
+     * (the output-priority rule).  Saturates at 0xF. */
+    static unsigned s_autoPrio = 0;
     /* v343: file-store open attempts, drawn on the readout (rows 16/17). */
     static unsigned s_logTry = 0;
     static unsigned s_logFrame = 0;
@@ -13631,9 +13636,11 @@ namespace {
      * 找到「箱子 + 相邻机器」，以及出货时把产物塞进箱子。
      *
      * ---- v1 的范围 ----------------------------------------------------
-     *   做：当前场景、上下左右紧邻、箱子→机器进料、机器→箱子出货
-     *   不做：木头小径等连接器、鱼塘、祝尼魔屋、洒水器、树液采集器、
-     *         OutputMachine 的额外产出（种子机的额外种子等）、后台场景、UI
+     *   做：当前场景、上下左右 + 四个斜角、箱子→机器进料、机器→箱子出货、
+     *        小径/地板连接器、树液采集器、鱼塘、容器=普通箱/石箱/大箱/
+     *        大石箱/冰箱
+     *   不做：祝尼魔箱、漏斗、迷你出货箱、祝尼魔小屋/磨坊/筒仓、果树/浆果丛/
+     *        茶树等地形产出、出货优先级、单箱设置、UI 高亮、后台场景
      *
      * 出货的清理顺序照抄原版 Object.checkForAction 里手动收成品那一段：
      *     heldObject = null; readyForHarvest = false; showNextIndex = false;
@@ -13667,9 +13674,16 @@ namespace {
     }
 
     constexpr uintptr_t kGame1CurrentLocOff = SDV_OFF(kGame1CurrentLocOff, 0x14407B0u);
+    /* v487: Game1._activeClickableMenu.  Automation stands down while a menu is
+     * open -- the player is very likely dragging items in a chest the cycle is
+     * about to fill or drain, and game time does not advance in menus anyway. */
+    constexpr uintptr_t kGame1MenuOff = SDV_OFF(kGame1MenuOff, 0xC95C140u);
     constexpr uintptr_t kDictTryGetOff      = SDV_OFF(kDictTryGetOff,      0x19A1710u);
     constexpr uintptr_t kChestAddItemOff    = SDV_OFF(kChestAddItemOff,    0x1A0D680u);
     constexpr uintptr_t kChestGetItemsOff   = SDV_OFF(kChestGetItemsOff,   0x1A0D350u);
+    /* v489: Inventory.ContainsId(string) -- the plain method on the concrete
+     * StardewValley.Inventories.Inventory that GetItemsForPlayer returns. */
+    constexpr uintptr_t kInvContainsIdOff   = SDV_OFF(kInvContainsIdOff,   0x15A8130u);
     constexpr uintptr_t kAutoLoadOff        = SDV_OFF(kAutoLoadOff,        0x19EBF70u);
     constexpr uintptr_t kItemResetPsiOff    = SDV_OFF(kItemResetPsiOff,    0x15AF470u);
     constexpr uintptr_t kGetMachineDataOff  = SDV_OFF(kGetMachineDataOff,  0x19DB930u);
@@ -13683,6 +13697,20 @@ namespace {
      * Field offsets: Building.tileX/tileY/tilesWide/tilesHigh are NetInts at
      * 0x40/0x48/0x50/0x58; FishPond.output is a NetRef<Item> at 0x178. */
     constexpr uintptr_t kFishPondUpdateOff  = SDV_OFF(kFishPondUpdateOff,  0x120AE00u);
+    /* v490: Junimo huts.  Same trick as the pond: Building.Update reaches every
+     * building in the current location.  JunimoHut.GetOutputChest() is a plain
+     * one-argument method returning the chest the junimos fill (it tail-calls
+     * Building's chest lookup with a constant key), so collecting is just
+     * "read that Inventory, hand each item to a touching chest, then clear the
+     * slot" -- the same order the pond uses, and nothing touches the hut's own
+     * harvest bookkeeping. */
+    constexpr uintptr_t kJunimoHutUpdateOff = SDV_OFF(kJunimoHutUpdateOff, 0x1213260u);
+    constexpr uintptr_t kHutOutputChestOff  = SDV_OFF(kHutOutputChestOff,  0x12120A0u);
+    /* StardewValley.Inventories.Inventory's own methods (same object
+     * Chest.GetItemsForPlayer returns; see v489). */
+    constexpr uintptr_t kInvCountOff        = SDV_OFF(kInvCountOff,        0x15A7A00u);
+    constexpr uintptr_t kInvGetItemOff      = SDV_OFF(kInvGetItemOff,      0x15A7A20u);
+    constexpr uintptr_t kInvSetItemOff      = SDV_OFF(kInvSetItemOff,      0x15A7A40u);
     constexpr uintptr_t kPondOutputOff      = 0x178u;
     constexpr uintptr_t kBuildingTileXOff   = 0x40u;
     constexpr uintptr_t kBuildingTileYOff   = 0x48u;
@@ -14139,6 +14167,14 @@ namespace {
     static unsigned s_autoHb = 0;
     static void (*s_origChestUpdate)(void*, void*) = nullptr;
     static void (*s_origPondUpdate)(void*, void*) = nullptr;
+    /* v490: Junimo huts seen this pass. */
+    static void (*s_origHutUpdate)(void*, void*) = nullptr;
+    static void* s_regHuts[16] = {};
+    static int s_regHutX[16] = {};
+    static int s_regHutY[16] = {};
+    static int s_regHutW[16] = {};
+    static int s_regHutH[16] = {};
+    static int s_regHutCount = 0;
     static void (*s_origObjectUpdate)(void*, void*) = nullptr;
 
     /* Read / write a Net* field's value.  NetValueSlot already validates both
@@ -14193,12 +14229,19 @@ namespace {
 
     bool IsPlainChest(void* obj) {
         const int idx = ChestParentSheetIndex(obj);
-        if (idx == 130 || idx == 232) {
+        /* 130 chest, 232 stone chest, 216 fridge / mini-fridge, 248 mini
+         * shipping bin (a Chest with SpecialChestType.MiniShippingBin).  The
+         * 1.6 "big" variants use string ids instead of numbers, so they can
+         * only be recognised by ItemId. */
+        if (idx == 130 || idx == 232 || idx == 216 || idx == 248) {
             return true;
         }
         auto getItemId = reinterpret_cast<void* (*)(void*)>(g_base + kGetItemIdOff);
         void* id = getItemId(obj);
-        return StrEqualsAscii(id, "130") || StrEqualsAscii(id, "232");
+        return StrEqualsAscii(id, "130") || StrEqualsAscii(id, "232") ||
+               StrEqualsAscii(id, "216") || StrEqualsAscii(id, "248") ||
+               StrEqualsAscii(id, "BigChest") ||
+               StrEqualsAscii(id, "BigStoneChest");
     }
 
     /* ---- v340: registry-based grouping --------------------------------
@@ -15147,6 +15190,41 @@ namespace {
     /* Put `item` into the first group chest that takes all of it. */
     bool StoreInGroup(void* item, int chestCount) {
         auto addItem = reinterpret_cast<void* (*)(void*, void*)>(g_base + kChestAddItemOff);
+        auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
+        /* v489: output priority.  PC Automate stores machine output in
+         *   (1) chests marked "put items here first",
+         *   (2) chests that already hold an item of the same type,
+         *   (3) any chest.
+         * We have no per-chest flags, so rule (2) is the one that matters in
+         * practice: a group's product should not be scattered across every
+         * chest just because they are all connected.
+         *
+         * Chest.GetItemsForPlayer() hands back an Inventory (the same object
+         * addItem uses), and Inventory.ContainsId(string) is a plain method --
+         * no interface dispatch.  Item.ItemId is the managed string it wants. */
+        void* itemId = nullptr;
+        if (item != nullptr && Plausible(item)) {
+            itemId = reinterpret_cast<void* (*)(void*)>(g_base + kGetItemIdOff)(item);
+        }
+        if (itemId != nullptr && Plausible(itemId)) {
+            auto containsId =
+                reinterpret_cast<bool (*)(void*, void*)>(g_base + kInvContainsIdOff);
+            for (int i = 0; i < chestCount; ++i) {
+                void* inv = getItems(s_grpChests[i]);
+                if (inv == nullptr || !Plausible(inv)) {
+                    continue;
+                }
+                if (!containsId(inv, itemId)) {
+                    continue;
+                }
+                if (addItem(s_grpChests[i], item) == nullptr) {
+                    if (s_autoPrio < 0xFu) {
+                        ++s_autoPrio;
+                    }
+                    return true;
+                }
+            }
+        }
         for (int i = 0; i < chestCount; ++i) {
             if (addItem(s_grpChests[i], item) == nullptr) {
                 return true;
@@ -15220,6 +15298,13 @@ namespace {
         PushTile(tail, cx - 1.0f, cy);
         PushTile(tail, cx, cy + 1.0f);
         PushTile(tail, cx, cy - 1.0f);
+        /* v487: diagonals too.  PC Automate connects "in any direction
+         * including diagonal", and a chest tucked into a machine corner is a
+         * normal layout, so the four corner neighbours belong to the group. */
+        PushTile(tail, cx + 1.0f, cy + 1.0f);
+        PushTile(tail, cx + 1.0f, cy - 1.0f);
+        PushTile(tail, cx - 1.0f, cy + 1.0f);
+        PushTile(tail, cx - 1.0f, cy - 1.0f);
 
         while (head < tail) {
             const float x = s_frX[head];
@@ -15274,11 +15359,17 @@ namespace {
             PushTile(tail, x - 1.0f, y);
             PushTile(tail, x, y + 1.0f);
             PushTile(tail, x, y - 1.0f);
+            /* v487: diagonal neighbours, same rule as the seed tiles. */
+            PushTile(tail, x + 1.0f, y + 1.0f);
+            PushTile(tail, x + 1.0f, y - 1.0f);
+            PushTile(tail, x - 1.0f, y + 1.0f);
+            PushTile(tail, x - 1.0f, y - 1.0f);
         }
     }
 
     /* Defined below with the pond hook; RunAutomation is above it. */
     void CollectPonds();
+    void CollectHuts();
 
     /* v454: the item id of a managed Item, as an int.
      *
@@ -15420,6 +15511,19 @@ namespace {
         if (pl == nullptr) {
             return;
         }
+        /* v487: stand down while a menu is open.  The player is then most
+         * likely moving items inside a chest this cycle would be filling or
+         * draining, which is the one case where automation can eat an item
+         * (the same reason PC Automate pauses machines while a chest is open).
+         * Game time does not advance in menus, so the pass is only postponed. */
+        if (RangeReadable(reinterpret_cast<void*>(g_base + kGame1MenuOff), 8u) &&
+            *reinterpret_cast<void**>(g_base + kGame1MenuOff) != nullptr) {
+            if (s_v487Pause < 3u) {
+                ++s_v487Pause;
+                LOGF("v487 pause: a menu is open, cycle skipped");
+            }
+            return;
+        }
 
         auto resetPsi = reinterpret_cast<void (*)(void*)>(g_base + kItemResetPsiOff);
 
@@ -15554,6 +15658,8 @@ namespace {
         /* v371: ponds are not part of the machine groups -- they are buildings,
          * collected straight into a touching chest. */
         CollectPonds();
+        /* v490: same shape for Junimo huts, from their own output chest. */
+        CollectHuts();
 
         if (kAutomateLog) {
             LOGF("auto: pass end");
@@ -15591,6 +15697,7 @@ namespace {
             s_regChestCount = 0;
             s_regMachineCount = 0;
             s_regPondCount = 0;
+            s_regHutCount = 0;
             s_collecting = true;
             /* Written BEFORE the object walk of the next frame.  If the log
              * ends on this line the crash was inside the walk (our harvest
@@ -15693,6 +15800,110 @@ namespace {
             *reinterpret_cast<void**>(slot) = nullptr;
             if (s_autoOutput < 0xFu) {
                 ++s_autoOutput;
+            }
+        }
+    }
+
+    /* ---- v490: Junimo huts ------------------------------------------------
+     *
+     * A junimo hut is a Building whose harvested crops land in its own output
+     * chest (JunimoHut.GetOutputChest).  Vanilla leaves them there until the
+     * player opens the hut, so a hut next to a chest is exactly the case
+     * Automate handles: pull the chest's contents into that chest.
+     *
+     * Order matters and is the pond's: offer the item to a touching chest
+     * first, and only clear the slot once the chest took it.  A full chest
+     * therefore leaves the hut's output untouched instead of eating it.
+     */
+    void RegAddHut(void* hut) {
+        if (s_regHutCount >= 16) {
+            return;
+        }
+        for (int i = 0; i < s_regHutCount; ++i) {
+            if (s_regHuts[i] == hut) {
+                return;
+            }
+        }
+        void* tx = NetValueSlot(hut, kBuildingTileXOff, 4u);
+        void* ty = NetValueSlot(hut, kBuildingTileYOff, 4u);
+        void* tw = NetValueSlot(hut, kBuildingWideOff, 4u);
+        void* th = NetValueSlot(hut, kBuildingHighOff, 4u);
+        if (tx == nullptr || ty == nullptr || tw == nullptr || th == nullptr) {
+            return;
+        }
+        s_regHuts[s_regHutCount] = hut;
+        s_regHutX[s_regHutCount] = *reinterpret_cast<int*>(tx);
+        s_regHutY[s_regHutCount] = *reinterpret_cast<int*>(ty);
+        s_regHutW[s_regHutCount] = *reinterpret_cast<int*>(tw);
+        s_regHutH[s_regHutCount] = *reinterpret_cast<int*>(th);
+        ++s_regHutCount;
+    }
+
+    void HookJunimoHutUpdate(void* self, void* gameTime) {
+        if (AutomateOn() && s_collecting && self != nullptr) {
+            RegAddHut(self);
+        }
+        if (s_origHutUpdate != nullptr) {
+            s_origHutUpdate(self, gameTime);
+        }
+    }
+
+    /* A registered chest that shares an edge with the given footprint. */
+    void* ChestTouchingFootprint(int x0, int y0, int w, int h) {
+        for (int c = 0; c < s_regChestCount; ++c) {
+            const int cx = static_cast<int>(s_regChestX[c]);
+            const int cy = static_cast<int>(s_regChestY[c]);
+            const bool side = (cy >= y0 && cy < y0 + h) &&
+                              (cx == x0 - 1 || cx == x0 + w);
+            const bool above = (cx >= x0 && cx < x0 + w) &&
+                               (cy == y0 - 1 || cy == y0 + h);
+            if (side || above) {
+                return s_regChests[c];
+            }
+        }
+        return nullptr;
+    }
+
+    void CollectHuts() {
+        if (s_regHutCount == 0) {
+            return;
+        }
+        auto getOutput = reinterpret_cast<void* (*)(void*)>(g_base + kHutOutputChestOff);
+        auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
+        auto getCount = reinterpret_cast<int (*)(void*)>(g_base + kInvCountOff);
+        auto getItem = reinterpret_cast<void* (*)(void*, int)>(g_base + kInvGetItemOff);
+        auto setItem = reinterpret_cast<void (*)(void*, int, void*)>(g_base + kInvSetItemOff);
+        auto addItem = reinterpret_cast<void* (*)(void*, void*)>(g_base + kChestAddItemOff);
+        for (int p = 0; p < s_regHutCount; ++p) {
+            void* chest = ChestTouchingFootprint(s_regHutX[p], s_regHutY[p],
+                                                 s_regHutW[p], s_regHutH[p]);
+            if (chest == nullptr) {
+                continue;               /* no chest against this hut */
+            }
+            void* out = getOutput(s_regHuts[p]);
+            if (out == nullptr || !Plausible(out)) {
+                continue;               /* hut has no output chest */
+            }
+            void* inv = getItems(out);
+            if (inv == nullptr || !Plausible(inv)) {
+                continue;
+            }
+            const int n = getCount(inv);
+            if (n <= 0 || n > 128) {
+                continue;
+            }
+            for (int i = 0; i < n; ++i) {
+                void* item = getItem(inv, i);
+                if (item == nullptr || !Plausible(item)) {
+                    continue;
+                }
+                if (addItem(chest, item) != nullptr) {
+                    continue;           /* chest full: leave it in the hut */
+                }
+                setItem(inv, i, nullptr);
+                if (s_autoOutput < 0xFu) {
+                    ++s_autoOutput;
+                }
             }
         }
     }
@@ -19325,7 +19536,14 @@ namespace {
          * point for exactly this reason, but left the only call inside the
          * g_hudOn block, so turning the HUD off still took both bubbles with
          * it.  Everything BuildTileLabels() reads is its own state. */
-        if (kHudInfo) {
+        /* v492: no tile labels while a menu is open.  None of them is visible
+         * behind a menu, and building one allocates a managed string with no GC
+         * root -- the one path where a collection while the world is paused
+         * could hand the draw side a freed pointer.  This is a suspect in the
+         * animal-naming freeze bisect, so it is off in this build. */
+        if (kHudInfo &&
+            RangeReadable(reinterpret_cast<void*>(g_base + kGame1MenuOff), 8u) &&
+            *reinterpret_cast<void**>(g_base + kGame1MenuOff) == nullptr) {
             BuildTileLabels();
         }
         /* Probe A (one shot, never retried): allocate and construct a
@@ -23748,6 +23966,7 @@ extern "C" void exl_main(void* x0, void* x1) {
         { 0x01A0E610u, 0xD10183FFu, 0x6D0223E9u },
         { 0x019DF2D0u, 0xD10303FFu, 0x6D0523E9u },
         { 0x0120AE00u, 0xD101C3FFu, 0x6D0223E9u },
+        { 0x01213260u, 0xA9BE7BFDu, 0xA9014FF4u },
         { 0x014500A0u, 0xD10543FFu, 0xA9107BFDu },
         { 0x003943F0u, 0x17FFFFA4u, 0x00000000u },
         { 0x0181D1F0u, 0xD10683FFu, 0x6D1133EDu },
@@ -23862,6 +24081,11 @@ extern "C" void exl_main(void* x0, void* x1) {
             HOOKF(base + kFishPondUpdateOff, &HookFishPondUpdate, true));
         LOGF("automate: fish pond hook %p",
              reinterpret_cast<void*>(s_origPondUpdate));
+        /* v490: junimo huts, same per-frame Building hook idea. */
+        s_origHutUpdate = reinterpret_cast<void (*)(void*, void*)>(
+            HOOKF(base + kJunimoHutUpdateOff, &HookJunimoHutUpdate, true));
+        LOGF("automate: junimo hut hook %p",
+             reinterpret_cast<void*>(s_origHutUpdate));
     }
 
     /* stage 2c: per-frame auto tool use while driving.
