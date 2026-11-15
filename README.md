@@ -1,4 +1,4 @@
-# 星露谷物语（Switch）Mod — v1.10
+# 星露谷物语（Switch）Mod — v1.10.1
 
 作者 **Banana**　·　来源仓库：<https://github.com/lisooreal0202-commits/stardew-switch-mod>
 
@@ -14,6 +14,10 @@
 
 <details>
 <summary><b>版本历史</b></summary>
+
+**v1.10.1**（2026-11-16）
+- 补充：`使用说明.txt` 里也加上反馈入口（有问题请到 GitHub 仓库提 issue）。
+- 功能与 v1.10 完全相同，`subsdk8` 一个字节都没改。
 
 **v1.10**（2026-11-16）
 - 新增：**拖拉机不再受工具等级限制**。以前车上的斧 / 镐也会被「需要更好的斧头」拦住，
