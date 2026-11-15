@@ -130,8 +130,8 @@ constexpr u64 kTitleId     = 0x0100E65002BB8000ULL;   // Stardew Valley
 // Six characters on purpose: a four-character literal gets inlined as a
 // movz/movk pair instead of landing in .rodata, which makes "did this build
 // pick up my version string?" impossible to answer with strings(1).
-constexpr const char* kBuild = "v1.0.8";
-constexpr int         kBuildSeq = 21;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, ...
+constexpr const char* kBuild = "v1.0.9";
+constexpr int         kBuildSeq = 22;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, 22-23 = v1.0.9, ...
 // One round of "record the memory layout, touch nothing".  Flip to false once the
 // chain under 0x0BB90280 is understood.
 constexpr bool kDiagOnly = false;
@@ -1848,192 +1848,6 @@ bool poke(u64 off, const void* data, size_t size) {
     return R_SUCCEEDED(dmntchtWriteCheatProcessMemory(gNsoBase + off, data, size));
 }
 
-// ---------------------------------------------------------------- subsdk8 ---
-//
-// Publishes a set-time request into the mod's own slot.  Nothing here touches
-// timeOfDay or the date: the mod reads the request on its update thread.
-//
-// The slot is found by content, not by address.  This block used to carry the
-// module's text fingerprint and the slot offset, both read out of the ELF by
-// hand -- and both move on every rebuild, so a dev build and a release build
-// needed two different overlays, and a stale number only showed up as "找不到
-// subsdk8" with no clue which half was wrong.
-//
-// Now: find the module by its NX header, then scan its writable segment for the
-// marker at the front of the request struct.  One .ovl works with every build.
-
-constexpr u8 kSlotMagic[16] = {
-    'S', 'D', 'V', '-', 'S', 'E', 'T', 'T', 'I', 'M', 'E', '-', '0', '1', 0, 0
-};
-// `b #0x20` -- the branch every exlaunch module starts with, over its header.
-constexpr u32 kNxBranch = 0x14000008u;
-// Offset of seq inside the request struct: the 16 marker bytes, then seq.
-constexpr u64 kSlotSeqOff = 16;
-
-u64  gSubsdkBase  = 0;
-u64  gTimeReqSlot = 0;
-char gTimeReqStatus[64] = "未测试";
-
-// The module's writable segment, scanned for the marker.  Windowed to the
-// first 2 MB of the module on purpose: the game's own main module passes the
-// header test below too (it is an NSO with a MOD0 header as well), but its data
-// segment sits ~190 MB into its image, so it falls outside this window and the
-// candidate is rejected in a few reads instead of a 15 MB scan.
-u64 scanSlotIn(u64 base) {
-    u64 total = 0;
-    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return 0;
-    static u8 buf[0x8000 + 16];
-    MemoryInfo chunk[32];
-    u64 off = 0;
-    while (off < total) {
-        u64 got = 0;
-        if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
-            break;
-        for (u64 i = 0; i < got; i++) {
-            const MemoryInfo& m = chunk[i];
-            if (!(m.perm & Perm_W)) continue;
-            if (m.addr < base || m.addr >= base + 0x200000ull) continue;
-            for (u64 p = 0; p < m.size; p += 0x8000) {
-                u64 n = m.size - p;
-                if (n > 0x8000) n = 0x8000;
-                u64 rd = n + 16;
-                if (p + rd > m.size) rd = m.size - p;
-                if (rd < 16) break;
-                if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr + p, buf, rd)))
-                    continue;
-                for (u64 k = 0; k + 16 <= rd; k += 4) {
-                    if (std::memcmp(buf + k, kSlotMagic, 16) == 0) {
-                        return m.addr + p + k;
-                    }
-                }
-            }
-        }
-        off += got;
-    }
-    return 0;
-}
-
-// The header test alone is not enough to identify the mod -- see above -- so a
-// candidate only counts once the marker turns up inside it.
-//
-// Every outcome is logged and left in gTimeReqStatus: this is the one
-// cross-repo dependency in the overlay, and "the hour does not move" is
-// otherwise indistinguishable from "the press was not received".
-bool findSubsdk() {
-    if (gSubsdkBase && gTimeReqSlot) return true;
-    u64 total = 0;
-    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读映射失败");
-        logError("subsdk: mapping count failed");
-        return false;
-    }
-    MemoryInfo chunk[32];
-    u64 off = 0;
-    int cands = 0;
-    while (off < total) {
-        u64 got = 0;
-        if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
-            break;
-        for (u64 i = 0; i < got; i++) {
-            const MemoryInfo& m = chunk[i];
-            if (!(m.perm & Perm_X)) continue;
-            u32 head[3] = {};
-            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr, head, sizeof(head))))
-                continue;
-            if (head[0] != kNxBranch) continue;
-            // The two words after the branch are the offsets of __nx_mod0 and
-            // __nx_modver.  They always sit 0x1C apart, and MOD0 sits at the
-            // first one -- which is in .rodata, so it is outside this mapping.
-            if (head[2] != head[1] + 0x1Cu) continue;
-            if (head[1] < 0x1000u || head[1] > 0x1000000u) continue;
-            u8 tag[4] = {};
-            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr + head[1], tag, 4)))
-                continue;
-            if (tag[0] != 'M' || tag[1] != 'O' || tag[2] != 'D' || tag[3] != '0')
-                continue;
-            ++cands;
-            const u64 slot = scanSlotIn(m.addr);
-            logLine("subsdk: candidate %016llX slot %016llX",
-                    (unsigned long long)m.addr, (unsigned long long)slot);
-            if (!slot) continue;
-            gSubsdkBase  = m.addr;
-            gTimeReqSlot = slot;
-            std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "已连接");
-            logLine("subsdk: module %016llX slot %016llX",
-                    (unsigned long long)m.addr, (unsigned long long)slot);
-            return true;
-        }
-        off += got;
-    }
-    // Two different failures, two different fixes: no exlaunch module at all
-    // means the native mod is not installed; a module without the marker means
-    // the installed one is older than the request slot.  Saying "not found"
-    // for both is what sent the first report of this in the wrong direction.
-    if (cands == 0) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "未找到 mod");
-        logError("subsdk: no exlaunch module in the process (nothing starts with "
-                 "b #0x20) -- the native mod is not installed");
-    } else {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "mod 版本旧");
-        logError("subsdk: %d exlaunch module(s), none carries the %s marker -- "
-                 "the installed mod predates the request slot",
-                 cands, "SDV-SETTIME-01");
-    }
-    return false;
-}
-
-// Odd/even seqlock: odd seq means "being written", even means "published".
-//
-// The return value separates "there is no slot to write to" from "the write
-// itself failed": the caller falls back to a plain field write only in the
-// first case.
-enum TimeSubmit : u8 { kTimeOk = 0, kTimeNoSlot = 1, kTimeFailed = 2 };
-
-TimeSubmit submitTimeRequest(int hhmm) {
-    if (!findSubsdk()) {
-        setStatus(gTimeReqStatus);
-        return kTimeNoSlot;
-    }
-    const u64 slot = gTimeReqSlot;
-
-    const u64 addr = slot + kSlotSeqOff;
-    u32 seq = 0;
-    if (R_FAILED(dmntchtReadCheatProcessMemory(addr, &seq, sizeof(seq)))) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读 seq 失败");
-        logError("time: seq at %016llX unreadable", (unsigned long long)addr);
-        setStatus("读进度失败");
-        return kTimeFailed;
-    }
-    const u32 even = (seq + 2u) & ~1u;
-    const u32 odd  = even - 1u;
-    const s32 tgt  = hhmm;
-
-    if (!pokeAbs(addr, &odd, 4)) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(奇) 失败");
-        logError("time: seq write (odd) failed");
-        setStatus("写进度失败");
-        return kTimeFailed;
-    }
-    if (!pokeAbs(addr + 4, &tgt, 4)) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 target 失败");
-        logError("time: target write failed (slot %016llX)",
-                 (unsigned long long)slot);
-        setStatus("写时刻失败");
-        return kTimeFailed;
-    }
-    if (!pokeAbs(addr, &even, 4)) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(偶) 失败");
-        logError("time: seq write (even) failed");
-        setStatus("写进度失败");
-        return kTimeFailed;
-    }
-    std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus),
-                  "已提交 %d seq %u->%u", hhmm, seq, even);
-    logLine("time: request %d seq %u->%u slot %016llX", hhmm, seq, even,
-            (unsigned long long)slot);
-    return kTimeOk;
-}
-
 // peek() adds the module base; a MonoString object lives on the managed heap at
 // an absolute address, so it needs the raw form.
 bool peekAbs(u64 addr, void* out, size_t size) {
@@ -3717,13 +3531,6 @@ public:
         auto* note2 = new tsl::elm::ListItem("写入后按新日期继续");
         note2->setValue("要回原值只能读档", true);
         list->addItem(note2);
-        // Without the native mod the clock row cannot do anything, and that
-        // failure used to be invisible.  The status string is the same one the
-        // request path writes, so this row answers "is the mod hooked up?"
-        // without opening the log.
-        mMod = new tsl::elm::ListItem("原生 mod");
-        mMod->setValue(gTimeReqStatus, true);
-        list->addItem(mMod);
         // The resolved pair, on screen.  Every "nothing happened" report so far
         // came down to which pair had been picked, and that answer lived only
         // in the log -- which nobody has when the page is in front of them.
@@ -3783,12 +3590,8 @@ private:
         logLine("date/time read: day=%u clock=%u (%s)", (unsigned)mSeenDay,
                 (unsigned)mSeenClock,
                 mSeenClock ? "hhmm" : "unreadable");
-        // Resolving the mod here means the page opens with an answer instead of
-        // "未测试" and a wait for the first write to find out.
-        findSubsdk();
         if (mCur)   mCur->setValue(curText());
         if (mDay)   mDay->setValue(dayText(gDay));
-        if (mMod)   mMod->setValue(gTimeReqStatus, true);
         refreshClockRows();
     }
 
@@ -3911,35 +3714,25 @@ private:
             setStatus(msg);
             return true;
         }
-        // Two independent results, and the subtitle can only show one.  A
-        // failed submit already put its own reason there (读进度失败 / 写时刻
-        // 失败), so success is the only case that earns a message here -- and
-        // only when the day write above did not already fail.
-        const TimeSubmit r = submitTimeRequest((int)v);
-        if (mMod) mMod->setValue(gTimeReqStatus, true);
-        if (r == kTimeNoSlot) {
-            // No request slot: write the field the way every build before the
-            // slot did.  The clock moves immediately, but the game's own
-            // per-ten-minute work (HUD, music, menus, farmer) waits for the
-            // next natural tick -- that is the trade, and the 原生 mod row says
-            // which of the two paths this press took.
-            const DateFields f = dateFields();
-            if (!f.time) {
-                setStatus("找不到时间字段");
-                logError("time: no slot and no resolved timeOfDay field");
-                return true;
-            }
-            if (writeField(f.time, v) && ok) {
-                logLine("time: no request slot, wrote timeOfDay directly at %08X "
-                        "(world state not advanced)", (unsigned)f.time);
-                setStatus("直写生效");
-            }
+        // Both fields are plain writes, the way v1.0.7 did it.  The clock moves
+        // immediately; the game's own per-ten-minute bookkeeping catches up on
+        // its next tick.  Routing it through sdv_native was tried on 2026-11-08
+        // (commit 192cc24) because that bookkeeping was thought to be what
+        // black-screened the console -- 7c7fed9 found it was the day write, so
+        // the overlay is back to touching the field itself.
+        const DateFields f = dateFields();
+        if (!f.time) {
+            setStatus("找不到时间字段");
+            logError("time: no resolved timeOfDay field, clock write refused");
             return true;
         }
-        if (r == kTimeFailed || !ok) return true;
-        char msg[48];
-        std::snprintf(msg, sizeof(msg), "已写入 %s", clockText(v).c_str());
-        setStatus(msg);
+        if (writeField(f.time, v) && ok) {
+            logLine("time: wrote timeOfDay at %08X (world state catches up on "
+                    "the next ten-minute tick)", (unsigned)f.time);
+            char msg[48];
+            std::snprintf(msg, sizeof(msg), "已写入 %s", clockText(v).c_str());
+            setStatus(msg);
+        }
         return true;
     }
 
@@ -3949,7 +3742,6 @@ private:
     tsl::elm::ListItem* mHour  = nullptr;
     tsl::elm::ListItem* mMin   = nullptr;
     tsl::elm::ListItem* mSave  = nullptr;
-    tsl::elm::ListItem* mMod   = nullptr;
     u32 gDay   = 1;     // pending write, seeded from the last good read
     u32 gClock = 600;
     u32 mSeenDay   = 0; // last successful read, 0 when the field was unreadable
