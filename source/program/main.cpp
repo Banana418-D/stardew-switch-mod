@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 517;
+    constexpr int kBuildNo = 518;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -13429,13 +13429,29 @@ namespace {
         return isEmpty(chest);
     }
 
-    /* ChestHelper.IsSupported: 130 / 232, player-placed only. */
+    /* ChestHelper.IsSupported, extended in v518.
+     *
+     * The numeric test (130 / 232) only knew the plain and the stone chest.
+     * The 1.6 big variants are still Chest instances but carry STRING item ids
+     * ("BigChest" / "BigStoneChest") and a different ParentSheetIndex, so they
+     * were rejected -- which is why picking up a chest only worked for the
+     * plain one.  The id string is checked through Item.get_ItemId (the same
+     * accessor the automation's container list uses), still only for
+     * player-placed chests. */
     bool IsCarryableChest(void* chest) {
         if (!IsChestObj(chest)) {
             return false;
         }
         const int idx = ChestParentSheetIndex(chest);
-        if (idx != 130 && idx != 232) {
+        bool ok = (idx == 130 || idx == 232);
+        if (!ok) {
+            void* id = reinterpret_cast<void* (*)(void*)>(g_base + kGetItemIdOff)(chest);
+            if (id != nullptr && Plausible(id)) {
+                ok = NameEquals(id, "BigChest") || NameEquals(id, "BigStoneChest") ||
+                     NameEquals(id, "130") || NameEquals(id, "232");
+            }
+        }
+        if (!ok) {
             return false;
         }
         return ChestFlag(chest, kChestPlayerChestOff);

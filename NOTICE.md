@@ -64,7 +64,7 @@ SOFTWARE.
 
 `source/program/npc_crop_table.hpp` reproduces the 38 per-NPC head-crop offsets
 from NPCMapLocations' `ModConstants.NpcMarkerOffsets`, so villagers look on
-Switch the way they look on PC.  They are data rather than code, but they are
+Switch.  They are data rather than code, but they are
 Bouhm's tuned values, so they are copied verbatim under the MIT licence and this
 notice travels with them.  Three further entries (Bouncer / Henchman / MrQi)
 were measured for this project.  No code from that mod is included.
