@@ -8,8 +8,8 @@ subsdk8       md5 15ac9e60b26bcedda5a38e2114c56bcd
               186279 字节
 main.npdm     md5 6f281d0b48f69eb26fdebb1ffd265ef6
               1516 字节
-sdv_items.ovl md5 366c95fb379f764a8edf756c6a2ea38c
-              593976 字节
+sdv_items.ovl md5 e4273bd050eefb3d58e8aa08fdcbf75e
+              598072 字节
 cheats .txt   md5 dff9b9d9c985f91d69a11a067c6012bc
               739 字节
 horse.xnb     md5 4b8612f33b2eced80d62d3f186b6f88e

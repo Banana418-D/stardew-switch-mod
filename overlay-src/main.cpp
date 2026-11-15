@@ -130,8 +130,8 @@ constexpr u64 kTitleId     = 0x0100E65002BB8000ULL;   // Stardew Valley
 // Six characters on purpose: a four-character literal gets inlined as a
 // movz/movk pair instead of landing in .rodata, which makes "did this build
 // pick up my version string?" impossible to answer with strings(1).
-constexpr const char* kBuild = "v1.0.7";
-constexpr int         kBuildSeq = 18;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, ...
+constexpr const char* kBuild = "v1.0.8";
+constexpr int         kBuildSeq = 20;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, ...
 // One round of "record the memory layout, touch nothing".  Flip to false once the
 // chain under 0x0BB90280 is understood.
 constexpr bool kDiagOnly = false;
@@ -402,21 +402,40 @@ void dumpRuntime() {
 
 bool attach();   // defined below
 
-// Money.  The official 1.6.15.13 cheat patches one instruction:
+// Money.
+//
+// The accessor patched by the official cheat is one instruction:
 //
 //   013B97F8  B9406800   ldr w0, [x0, #0x68]     <- the money accessor
 //            529D4C00   movz w0, #60000          <- what the cheat writes
 //
-// The getter then reports a fixed amount, so the balance never goes down.
+// x0 there is the NetInt<int> the balance lives in, and +0x68 is its value --
+// the layout the friendship editor already writes.  Two things can be done
+// with that, and the page offers both:
+//
+//   设定一次   capture that object once, write the wanted number into it, and
+//              leave the accessor alone.  The balance is then a normal
+//              balance: buying something takes money off it.
+//   锁定       point the accessor at a stub that always returns the same
+//              number.  Purchases still move the real value, but the getter
+//              never reports it, so the HUD stays where it was set.
+//
+// The page only had the second one for a long time, which is why a balance set
+// to 30000 stayed at 30000 after a purchase.  Locking is now opt-in.
+//
+// Both start by capturing x0.  The object cannot be reached from the overlay:
+// the chain to it goes through a call (0x0140FEE0) that only runs inside the
+// game, so the stub stores x0 in scratch, the overlay reads it, and the site
+// goes back to the load.  The capture stub still performs the original load
+// and epilogue, so it is functionally the untouched accessor -- if nobody
+// collects the pointer it does no harm.
+//
 // One instruction can only hold a 16-bit immediate -- that is why the cheat
-// file stops at 65535 and why this page used to stop there too.  Anything
-// larger needs a second instruction, and there is no second word to spare at
-// the accessor.
+// file stops at 65535.  Anything larger needs a second instruction, and there
+// is no second word to spare at the accessor, so the stub lives in the tail of
+// .text.
 //
-// So the accessor is pointed at a stub in the tail of .text instead.
-//
-// The stub is four words, not three, and the fourth one matters.  The function
-// this sits in has a frame:
+// The stub is not three words.  The function this sits in has a frame:
 //
 //   013B97E0  stp x29, x30, [sp, #-0x10]!    prologue, sp drops by 16
 //   013B97E4  mov x29, sp
@@ -428,18 +447,24 @@ bool attach();   // defined below
 // A stub that just did movz/movk/ret skipped that epilogue and returned with
 // sp 16 bytes low, which corrupts the caller's stack on the very first money
 // read.  That was build 14's crash.  The epilogue word is copied verbatim from
-// the NSO, so the stub leaves the registers exactly as the original path did.
+// the NSO, so both stubs leave the registers exactly as the original path did.
 //
-//   movz w0, #lo16
-//   movk w0, #hi16, lsl 16
-//   ldp x29, x30, [sp], #0x10
-//   ret
+//   freeze:   movz w0, #lo16
+//             movk w0, #hi16, lsl 16
+//             ldp  x29, x30, [sp], #0x10
+//             ret
+//
+//   capture:  adrp x9, page(kMoneyCapture)
+//             str  x0, [x9, #slot]
+//             ldr  w0, [x0, #0x68]          <- the original word
+//             ldp  x29, x30, [sp], #0x10
+//             ret
 //
 // It sits just past the end of the item shell, in the padding between the end
 // of .text and the next page boundary where the executable mapping stops.  It
-// is written only after those sixteen bytes have been read and found zero (or
-// found to be an earlier copy of our own stub), so a future layout change
-// refuses the write rather than overwriting something live.
+// is written only after those words have been read and found zero (or found to
+// be an earlier copy of our own stub), so a future layout change refuses the
+// write rather than overwriting something live.
 constexpr u64 kMoneyInsn  = 0x013B97F8;
 constexpr u32 kMoneyOrig  = 0xB9406800;   // ldr w0, [x0, #0x68]
 
@@ -451,8 +476,13 @@ constexpr u32 kMoneyOrig  = 0xB9406800;   // ldr w0, [x0, #0x68]
 constexpr u64 kMoneyCave  = sdv::kShellAddr + sdv::kShellSize + 0x10;
 constexpr u32 kMoneyRet   = 0xD65F03C0;   // ret
 constexpr u32 kMoneyPop   = 0xA8C17BFD;   // ldp x29, x30, [sp], #0x10
-constexpr int kMoneyStub  = 4;            // words
+constexpr int kMoneyStubWords = 5;        // capture stub; the freeze stub uses 4
 constexpr u32 kMoneyMax   = 999999999;
+
+// Where the capture stub parks x0.  giveItem clears the first 0x60 bytes of
+// kScratch as its latch, so this sits past them and the two pages cannot stomp
+// on each other.
+constexpr u64 kMoneyCapture = kScratch + 0x80;
 
 // The r-x mapping runs to the next page boundary after .text, which is what
 // the loader reserved; anything written past it would land in rodata and the
@@ -462,7 +492,7 @@ constexpr u64 kMoneyTextEnd = (sdv::kShellAddr + 0x1000) & ~(u64)0xFFF;
 static_assert(kMoneyCave % 4 == 0, "money stub must be word aligned");
 static_assert(kMoneyCave >= sdv::kShellAddr + sdv::kShellSize,
               "money stub must not sit inside the shell body");
-static_assert(kMoneyCave + kMoneyStub * 4 <= kMoneyTextEnd,
+static_assert(kMoneyCave + kMoneyStubWords * 4 <= kMoneyTextEnd,
               "money stub must fit in the executable padding");
 
 // The last amount shown on the money page, kept out here so opening the menu
@@ -485,14 +515,46 @@ bool isBranch(u32 word) {
     return (word & 0xFC000000u) == 0x14000000u;
 }
 
-bool setMoney(u32 value) {
-    if (!attach()) return false;
-    if (value > kMoneyMax) value = kMoneyMax;
+// adrp x9, page(target).  Both addresses are module offsets and the base is
+// randomised the same way for both, so the page delta is a build-time constant.
+u32 adrpX9(u64 pc, u64 target) {
+    const s64 delta = ((s64)(target & ~(u64)0xFFF) - (s64)(pc & ~(u64)0xFFF)) >> 12;
+    const u32 immlo = (u32)delta & 3u;
+    const u32 immhi = (u32)((delta >> 2) & 0x7FFFF);
+    return 0x90000000u | (immlo << 29) | (immhi << 5) | 9u;
+}
 
-    // Two guards before anything is written.  The site must still be the load
-    // (or our own branch), and the cave must still be empty padding.  Either
-    // check failing means this build's layout is not the one these offsets
-    // were taken from, and a write would land in unrelated code.
+// str x0, [x9, #off] -- unsigned scaled offset, so off has to be 8-aligned.
+u32 strX0At(u64 target) {
+    const u32 off = (u32)(target & 0xFFFu);
+    return 0xF9000000u | ((off >> 3) << 10) | (9u << 5);
+}
+
+void buildFreezeStub(u32 value, u32 out[kMoneyStubWords]) {
+    out[0] = movzW0(value);
+    out[1] = movkW0Hi(value);
+    out[2] = kMoneyPop;
+    out[3] = kMoneyRet;
+    out[4] = 0;
+}
+
+void buildCaptureStub(u32 out[kMoneyStubWords]) {
+    out[0] = adrpX9(kMoneyCave, kMoneyCapture);
+    out[1] = strX0At(kMoneyCapture);
+    out[2] = kMoneyOrig;
+    out[3] = kMoneyPop;
+    out[4] = kMoneyRet;
+}
+
+enum MoneyMode : u8 { kMoneyOff = 0, kMoneyOnce = 1, kMoneyLocked = 2 };
+static MoneyMode gMoneyMode = kMoneyOff;
+
+bool pokeAbs(u64 addr, const void* data, size_t size);
+
+// The site must still be the load, or our own branch.  Anything else means
+// this build's layout is not the one these offsets were taken from, and a
+// write would land in unrelated code.
+bool moneySiteSafe() {
     u32 site = 0;
     if (!peek(kMoneyInsn, &site, sizeof(site))) {
         setStatus("读取失败");
@@ -504,34 +566,38 @@ bool setMoney(u32 value) {
                  (unsigned)kMoneyOrig);
         return false;
     }
+    return true;
+}
 
-    u32 cave[kMoneyStub] = { 0, 0, 0, 0 };
+// Blank padding, or an earlier copy of either of our own stubs.  build 14's
+// three-word stub counts too, so a console that ran the crashing build can be
+// upgraded without restarting the game.
+bool moneyCaveSafe() {
+    u32 cave[kMoneyStubWords] = {};
     if (!peek(kMoneyCave, cave, sizeof(cave))) {
         setStatus("读取失败");
         return false;
     }
-    const bool blank = cave[0] == 0 && cave[1] == 0 && cave[2] == 0 && cave[3] == 0;
-    const bool ours  = cave[3] == kMoneyRet && cave[2] == kMoneyPop &&
+    u32 cap[kMoneyStubWords];
+    buildCaptureStub(cap);
+    const bool blank = cave[0] == 0 && cave[1] == 0 && cave[2] == 0 &&
+                       cave[3] == 0 && cave[4] == 0;
+    bool capture = true;
+    for (int i = 0; i < kMoneyStubWords; ++i) capture = capture && cave[i] == cap[i];
+    const bool ours4 = cave[4] == 0 && cave[3] == kMoneyRet && cave[2] == kMoneyPop &&
                        (cave[0] & 0xFFE0001Fu) == 0x52800000u;
-    // build 14's stub, which had no epilogue.  Recognising it means a console
-    // that ran the crashing build can be upgraded in place; without this the
-    // guard would read those three words as a foreign occupant and refuse to
-    // write until the game was restarted.
-    const bool ours14 = cave[3] == 0 && cave[2] == kMoneyRet &&
+    const bool ours14 = cave[4] == 0 && cave[3] == 0 && cave[2] == kMoneyRet &&
                         (cave[0] & 0xFFE0001Fu) == 0x52800000u;
-    if (!blank && !ours && !ours14) {
-        setStatus("代码洞被占用");
-        logError("money: cave holds %08X %08X %08X %08X (refusing)",
-                 (unsigned)cave[0], (unsigned)cave[1], (unsigned)cave[2],
-                 (unsigned)cave[3]);
-        return false;
-    }
+    if (blank || capture || ours4 || ours14) return true;
+    logError("money: cave holds %08X %08X %08X %08X %08X (refusing)",
+             (unsigned)cave[0], (unsigned)cave[1], (unsigned)cave[2],
+             (unsigned)cave[3], (unsigned)cave[4]);
+    setStatus("代码洞被占用");
+    return false;
+}
 
-    // The epilogue word is part of the stub, not an optional extra: without it
-    // this returns with sp still 16 bytes low.
-    const u32 stub[kMoneyStub] = { movzW0(value), movkW0Hi(value),
-                                   kMoneyPop, kMoneyRet };
-    if (!poke(kMoneyCave, stub, sizeof(stub))) {
+bool moneyArm(const u32 stub[kMoneyStubWords]) {
+    if (!poke(kMoneyCave, stub, kMoneyStubWords * 4)) {
         setStatus("写桩失败");
         return false;
     }
@@ -540,11 +606,120 @@ bool setMoney(u32 value) {
         setStatus("写跳转失败");
         return false;
     }
+    return true;
+}
 
-    logLine("money: %u via cave (site %08X -> %08X, stub %08X %08X %08X %08X)",
-            (unsigned)value, (unsigned)kMoneyInsn, (unsigned)br,
+// The old behaviour, now a switch: the accessor reports this number no matter
+// what the balance really is.
+bool setMoneyLocked(u32 value) {
+    if (!attach()) return false;
+    if (value > kMoneyMax) value = kMoneyMax;
+    if (!moneySiteSafe() || !moneyCaveSafe()) return false;
+
+    u32 stub[kMoneyStubWords];
+    buildFreezeStub(value, stub);
+    if (!moneyArm(stub)) return false;
+
+    gMoneyMode = kMoneyLocked;
+    logLine("money: lock %u (site %08X -> %08X, stub %08X %08X %08X %08X)",
+            (unsigned)value, (unsigned)kMoneyInsn,
+            (unsigned)branchTo((u32)kMoneyInsn, (u32)kMoneyCave),
             (unsigned)stub[0], (unsigned)stub[1], (unsigned)stub[2],
             (unsigned)stub[3]);
+    char msg[48];
+    std::snprintf(msg, sizeof(msg), "锁定 %u", (unsigned)value);
+    setStatus(msg);
+    return true;
+}
+
+// Write the balance once and leave the accessor alone, so purchases take money
+// off it like they normally would.
+//
+// The object is captured rather than followed: the chain to it goes through a
+// call that only runs inside the game.  Once the pointer is in scratch, the
+// site goes back to the original load and the value is written into the
+// NetInt the accessor was reading.
+bool setMoneyOnce(u32 value) {
+    if (!attach()) return false;
+    if (value > kMoneyMax) value = kMoneyMax;
+    if (!moneySiteSafe() || !moneyCaveSafe()) return false;
+
+    // A pointer left behind by the last attempt must not be mistaken for this
+    // one's object.
+    const u64 zero = 0;
+    if (!poke(kMoneyCapture, &zero, sizeof(zero))) {
+        setStatus("清槽失败");
+        return false;
+    }
+    u32 stub[kMoneyStubWords];
+    buildCaptureStub(stub);
+    if (!moneyArm(stub)) return false;
+
+    // The HUD reads the balance every frame, so this is normally the first
+    // iteration.  One second is the ceiling: the page must not look hung.
+    u64 obj = 0;
+    for (int i = 0; i < 40; ++i) {
+        svcSleepThread(25'000'000ULL);
+        if (!peek(kMoneyCapture, &obj, sizeof(obj))) break;
+        if (obj) break;
+    }
+
+    // Back to the load before the write: from here on the getter has to report
+    // the object, not the stub.
+    const u32 orig = kMoneyOrig;
+    poke(kMoneyInsn, &orig, sizeof(orig));
+    if (!obj || obj < 0x10000ull || obj >= 0x0000FFFFFFFFFFFFull) {
+        setStatus("没抓到字段");
+        logError("money: capture got %016llX (accessor never read?)",
+                 (unsigned long long)obj);
+        return false;
+    }
+
+    int cur = 0, prev = 0, tgt = 0;
+    if (R_FAILED(dmntchtReadCheatProcessMemory(obj + 0x68, &cur, 4))) {
+        setStatus("读字段失败");
+        logError("money: object %016llX unreadable", (unsigned long long)obj);
+        return false;
+    }
+    // A balance is never negative, and an object whose +0x68 is not a sane
+    // number is not the one we meant to write.
+    if (cur < 0 || cur > 2000000000) {
+        setStatus("字段不合理");
+        logError("money: object %016llX holds %d (refusing)",
+                 (unsigned long long)obj, cur);
+        return false;
+    }
+
+    // NetInt keeps value / previousValue / targetValue side by side, and the
+    // friendship editor writes all three.  Only do that when the neighbours
+    // look like the same number: if they are a flag or an owner pointer,
+    // sending a balance into them would corrupt the object.
+    const bool readNbr =
+        R_SUCCEEDED(dmntchtReadCheatProcessMemory(obj + 0x6C, &prev, 4)) &&
+        R_SUCCEEDED(dmntchtReadCheatProcessMemory(obj + 0x70, &tgt, 4));
+    const bool triple = readNbr && prev >= 0 && prev <= 2000000000 &&
+                        tgt >= 0 && tgt <= 2000000000 &&
+                        (prev > cur ? prev - cur : cur - prev) < 1000000 &&
+                        (tgt > cur ? tgt - cur : cur - tgt) < 1000000;
+
+    const int want = (int)value;
+    bool ok = pokeAbs(obj + 0x68, &want, 4);
+    if (ok && triple) {
+        pokeAbs(obj + 0x6C, &want, 4);
+        pokeAbs(obj + 0x70, &want, 4);
+    }
+    int back = 0;
+    ok = ok && R_SUCCEEDED(dmntchtReadCheatProcessMemory(obj + 0x68, &back, 4));
+    if (!ok || back != want) {
+        setStatus("写入未生效");
+        logError("money: wrote %d at %016llX, read back %d", want,
+                 (unsigned long long)obj, back);
+        return false;
+    }
+
+    gMoneyMode = kMoneyOnce;
+    logLine("money: %d -> %d at %016llX (neighbours %d/%d, triple=%d)",
+            cur, want, (unsigned long long)obj, prev, tgt, (int)triple);
     char msg[48];
     std::snprintf(msg, sizeof(msg), "金钱 %u", (unsigned)value);
     setStatus(msg);
@@ -559,15 +734,16 @@ bool restoreMoney() {
         setStatus("还原失败");
         return false;
     }
-    // The stub is left where it is.  Clearing it would put four zero words into
+    // The stub is left where it is.  Clearing it would put zero words into
     // executable memory, and the one thing that must not be there is a landing
     // site -- a core whose instruction cache still holds the old branch, or a
     // thread already inside the stub, would execute 00 00 00 00 and take the
     // game down at the exact moment the user asked for things to be safe.  With
-    // the site back to the load nothing can reach it, and setMoney() recognises
-    // its own stub when it next writes.
+    // the site back to the load nothing can reach it, and the guards recognise
+    // either stub when the next write happens.
+    gMoneyMode = kMoneyOff;
     logLine("money: restored %08X (stub left in place)", (unsigned)kMoneyInsn);
-    setStatus("金钱已还原");
+    setStatus("已恢复花钱");
     return true;
 }
 
@@ -576,6 +752,13 @@ bool restoreMoney() {
 bool moneyActive() {
     u32 site = 0;
     return peek(kMoneyInsn, &site, sizeof(site)) && isBranch(site);
+}
+
+// One-shot writes leave the accessor alone, so "not patched" no longer means
+// "nothing happened" -- the page needs both facts to describe the state.
+const char* moneyModeText() {
+    if (moneyActive()) return "已锁定";
+    return gMoneyMode == kMoneyOnce ? "已写入" : "未启用";
 }
 
 
@@ -1025,10 +1208,12 @@ struct SdvConfig {
     int  gather     = 0;
     bool gatherLock = false;
     bool waterCan   = false;
-    // Fixed balance, 0 meaning "off".  The patch lives in .text and is gone
-    // once the process exits, so this has to be re-applied on every menu open
-    // or a 500,000 setting would silently last exactly one session.
+    // Balance.  money is the amount the page remembers; moneyLock says whether
+    // it is enforced (the accessor stub) or was written once and left to
+    // behave like a normal balance.  A lock is a .text patch, so it is gone
+    // once the process exits and has to be re-applied on every menu open.
     unsigned int money = 0;
+    bool moneyLock = false;
 };
 
 SdvConfig gCfg;
@@ -1053,7 +1238,7 @@ void applySavedConfig() {
                        gCfg.allRecipes || gCfg.allCollections ||
                        gCfg.stamina ||
                        gCfg.gather != 0 || gCfg.gatherLock || gCfg.waterCan ||
-                       gCfg.money != 0;
+                       (gCfg.money != 0 && gCfg.moneyLock);
     if (!anyOn && !gOpen) {
         // Nothing to enforce and nothing connected: connecting just to look
         // would turn a quiet menu into "挂载失败" for anyone who opens the
@@ -1070,13 +1255,16 @@ void applySavedConfig() {
     setStamina(gCfg.stamina, true);
     setGatherLock(gCfg.gatherLock, true);
     setWaterCan(gCfg.waterCan, true);
-    // Money is a .text patch like the rest, so it evaporates with the process;
-    // without this a 500,000 balance would survive exactly one session.  And
-    // like the rest it has to be enforced in both directions -- a config that
-    // says off while the accessor still branches into the stub is exactly the
-    // lie the 已关 switches used to tell, so the original word goes back too.
-    if (gCfg.money) {
-        setMoney(gCfg.money);
+    // A lock is a .text patch like the rest, so it evaporates with the process;
+    // without this a locked balance would survive exactly one session.  The
+    // unlock direction matters just as much -- a config that says unlocked
+    // while the accessor still branches into the stub is exactly the lie the
+    // 已关 switches used to tell, so the original word goes back too.
+    //
+    // A one-shot amount is deliberately NOT re-applied here: re-adding it on
+    // every menu open would refill a balance the player had just spent down.
+    if (gCfg.money != 0 && gCfg.moneyLock) {
+        setMoneyLocked(gCfg.money);
     } else {
         u32 site = 0;
         if (peek(kMoneyInsn, &site, sizeof(site)) && site != kMoneyOrig)
@@ -1086,12 +1274,12 @@ void applySavedConfig() {
     // about any one of them, so put the connection status back.
     setStatus("已连接");
     logLine("config enforced on menu open (one_hit=%d water=%d recipe=%d coll=%d "
-            "speed=%d fish=%d stam=%d gather=%d lock=%d can=%d money=%u)",
+            "speed=%d fish=%d stam=%d gather=%d lock=%d can=%d money=%u lock=%d)",
             (int)gCfg.oneHitKill, (int)gCfg.autoWater,
             (int)gCfg.allRecipes, (int)gCfg.allCollections,
             gCfg.speed, (int)gCfg.autoFish, (int)gCfg.stamina,
             gCfg.gather, (int)gCfg.gatherLock, (int)gCfg.waterCan,
-            (unsigned)gCfg.money);
+            (unsigned)gCfg.money, (int)gCfg.moneyLock);
     // After the patches are applied, never before: a config that says "on" is
     // *supposed* to disagree with memory until this function has finished.
     checkToggleConsistency();
@@ -1485,7 +1673,7 @@ void checkToggleConsistency() {
         lockS    != (gCfg.gatherLock ? 1 : 0) ||
         canS     != (gCfg.waterCan   ? 1 : 0) ||
         gatherIdx != gCfg.gather              ||
-        moneyOn  != (gCfg.money != 0);
+        moneyOn  != (gCfg.money != 0 && gCfg.moneyLock);
 
     if (bad) {
         logError("toggles: memory/config disagree"
@@ -1498,7 +1686,7 @@ void checkToggleConsistency() {
                  speedIdx, gCfg.speed, fishS, (int)gCfg.autoFish,
                  stamS, (int)gCfg.stamina, gatherIdx, gCfg.gather,
                  lockS, (int)gCfg.gatherLock, canS, (int)gCfg.waterCan,
-                 (int)moneyOn, (int)(gCfg.money != 0));
+                 (int)moneyOn, (int)(gCfg.money != 0 && gCfg.moneyLock));
         return;
     }
     logLine("toggles: memory and config agree (all 11 switches)");
@@ -1727,10 +1915,18 @@ u64 scanSlotIn(u64 base) {
 
 // The header test alone is not enough to identify the mod -- see above -- so a
 // candidate only counts once the marker turns up inside it.
+//
+// Every outcome is logged and left in gTimeReqStatus: this is the one
+// cross-repo dependency in the overlay, and "the hour does not move" is
+// otherwise indistinguishable from "the press was not received".
 bool findSubsdk() {
     if (gSubsdkBase && gTimeReqSlot) return true;
     u64 total = 0;
-    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return false;
+    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读映射失败");
+        logError("subsdk: mapping count failed");
+        return false;
+    }
     MemoryInfo chunk[32];
     u64 off = 0;
     while (off < total) {
@@ -1758,17 +1954,22 @@ bool findSubsdk() {
             if (!slot) continue;
             gSubsdkBase  = m.addr;
             gTimeReqSlot = slot;
+            std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "已连接");
+            logLine("subsdk: module %016llX slot %016llX",
+                    (unsigned long long)m.addr, (unsigned long long)slot);
             return true;
         }
         off += got;
     }
+    std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "未找到 mod");
+    logError("subsdk: no module carries the %s marker", "SDV-SETTIME-01");
     return false;
 }
 
 // Odd/even seqlock: odd seq means "being written", even means "published".
 bool submitTimeRequest(int hhmm) {
     if (!findSubsdk()) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到 subsdk8");
+        setStatus("未找到 mod");
         return false;
     }
     const u64 slot = gTimeReqSlot;
@@ -1777,6 +1978,8 @@ bool submitTimeRequest(int hhmm) {
     u32 seq = 0;
     if (R_FAILED(dmntchtReadCheatProcessMemory(addr, &seq, sizeof(seq)))) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读 seq 失败");
+        logError("time: seq at %016llX unreadable", (unsigned long long)addr);
+        setStatus("读进度失败");
         return false;
     }
     const u32 even = (seq + 2u) & ~1u;
@@ -1785,18 +1988,27 @@ bool submitTimeRequest(int hhmm) {
 
     if (!pokeAbs(addr, &odd, 4)) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(奇) 失败");
+        logError("time: seq write (odd) failed");
+        setStatus("写进度失败");
         return false;
     }
     if (!pokeAbs(addr + 4, &tgt, 4)) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 target 失败");
+        logError("time: target write failed (slot %016llX)",
+                 (unsigned long long)slot);
+        setStatus("写时刻失败");
         return false;
     }
     if (!pokeAbs(addr, &even, 4)) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(偶) 失败");
+        logError("time: seq write (even) failed");
+        setStatus("写进度失败");
         return false;
     }
     std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus),
                   "已提交 %d seq %u->%u", hhmm, seq, even);
+    logLine("time: request %d seq %u->%u slot %016llX", hhmm, seq, even,
+            (unsigned long long)slot);
     return true;
 }
 
@@ -2213,13 +2425,13 @@ void saveConfig() {
     FILE* f = std::fopen(kCfgPath, "w");
     if (!f) return;
     std::fprintf(f, "amount=%u\nquality=%u\nquery=%s\none_hit=%d\nauto_water=%d\nall_recipes=%d\nall_collections=%d\n"
-                    "speed=%d\nauto_fish=%d\nstamina=%d\ngather=%d\ngather_lock=%d\nwater_can=%d\nmoney=%u\n",
+                    "speed=%d\nauto_fish=%d\nstamina=%d\ngather=%d\ngather_lock=%d\nwater_can=%d\nmoney=%u\nmoney_lock=%d\n",
                  (unsigned)gAmount, (unsigned)gQuality, gQuery,
                  (int)gCfg.oneHitKill, (int)gCfg.autoWater, (int)gCfg.allRecipes,
                  (int)gCfg.allCollections,
                  gCfg.speed, (int)gCfg.autoFish, (int)gCfg.stamina,
                  gCfg.gather, (int)gCfg.gatherLock, (int)gCfg.waterCan,
-                 (unsigned)gCfg.money);
+                 (unsigned)gCfg.money, (int)gCfg.moneyLock);
     std::fclose(f);
 }
 
@@ -2270,6 +2482,8 @@ void loadConfig() {
             // The page remembers the last amount separately from whether it is
             // on, so turning it off does not throw the number away.
             if (gCfg.money) gMoneySet = gCfg.money;
+        } else if (std::strncmp(line, "money_lock=", 11) == 0) {
+            gCfg.moneyLock = std::atoi(line + 11) != 0;
         } else if (std::strncmp(line, "query=", 6) == 0) {
             std::strncpy(gQuery, line + 6, kQueryMax);
             gQuery[kQueryMax] = '\0';
@@ -3246,23 +3460,22 @@ public:
         mFrame = frame;
 
         auto list = new tsl::elm::List();
-        list->addItem(new tsl::elm::CategoryHeader("固定金额（花不完）"));
+        list->addItem(new tsl::elm::CategoryHeader("余额"));
 
         if (gMoneySet > kMoneyMax) gMoneySet = kMoneyMax;
 
-        mState = new tsl::elm::ListItem("状态", moneyActive() ? "已启用" : "未启用");
+        mState = new tsl::elm::ListItem("状态", moneyModeText());
         list->addItem(mState);
 
-        // Left/Right adjusts, A applies.  The list owns up/down for moving
+        // Left/Right adjusts, A writes once.  The list owns up/down for moving
         // between rows, so the horizontal pair is the only free axis -- and
         // returning true keeps the same press from also shifting focus.
         mAmount = new tsl::elm::ListItem("金额", moneyText(gMoneySet));
         mAmount->setClickListener([this](u64 keys) {
             if (keys & HidNpadButton_Left) {
                 const u32 step = moneyStep(gMoneySet);
-                // Never down to zero: zero is not an amount here, it is what
-                // the 关闭 row means, and reaching it by holding left would
-                // arm a write of 0 instead of restoring the balance.
+                // Never down to zero: a balance of zero is not what this row
+                // means, and holding left would then arm a write of 0.
                 gMoneySet = gMoneySet > step ? gMoneySet - step : 1000;
                 mAmount->setValue(moneyText(gMoneySet));
                 return true;
@@ -3283,8 +3496,12 @@ public:
         list->addItem(mAmount);
 
         auto* hint = new tsl::elm::ListItem("调整金额");
-        hint->setValue("← → 增减，A 应用", true);
+        hint->setValue("← → 增减，A 写入", true);
         list->addItem(hint);
+
+        auto* hintOnce = new tsl::elm::ListItem("写入后照常花钱");
+        hintOnce->setValue("买东西会扣钱", true);
+        list->addItem(hintOnce);
 
         list->addItem(new tsl::elm::CategoryHeader("一键设定"));
         addPreset(list, "3 万", 30000);
@@ -3292,18 +3509,29 @@ public:
         addPreset(list, "50 万", 500000);
         addPreset(list, "9.9 亿（上限）", kMoneyMax);
 
-        list->addItem(new tsl::elm::CategoryHeader("还原"));
-        auto* off = new tsl::elm::ListItem("关闭（余额恢复正常）");
-        off->setClickListener([this](u64 keys) {
+        list->addItem(new tsl::elm::CategoryHeader("固定余额"));
+        mLock = new tsl::elm::ListItem("锁定", moneyActive() ? "已开" : "已关");
+        mLock->setClickListener([this](u64 keys) {
             if (!(keys & HidNpadButton_A)) return false;
-            if (restoreMoney()) {
-                gCfg.money = 0;
+            if (moneyActive()) {
+                if (restoreMoney()) {
+                    gCfg.moneyLock = false;
+                    saveConfig();
+                    refreshState();
+                }
+            } else if (setMoneyLocked(gMoneySet)) {
+                gCfg.money = gMoneySet;
+                gCfg.moneyLock = true;
                 saveConfig();
-                if (mState) mState->setValue("未启用");
+                refreshState();
             }
             return true;
         });
-        list->addItem(off);
+        list->addItem(mLock);
+
+        auto* lockHint = new tsl::elm::ListItem("锁定后不减少");
+        lockHint->setValue("再按 A 取消", true);
+        list->addItem(lockHint);
 
         frame->setContent(list);
         return frame;
@@ -3314,13 +3542,22 @@ public:
     }
 
 private:
-    // Every path that turns the patch on goes through here, so the saved
+    // Every path that writes the balance goes through here, so the saved
     // config can never disagree with what is in memory.
     void applyMoney(u32 value) {
-        if (!setMoney(value)) return;
+        if (!setMoneyOnce(value)) return;
         gCfg.money = value;
+        // A one-shot write is not a lock.  Clearing the flag matters: a config
+        // that still said "locked" would re-install the stub on the next menu
+        // open and freeze a balance the player had just started spending.
+        gCfg.moneyLock = false;
         saveConfig();
-        if (mState) mState->setValue("已启用");
+        refreshState();
+    }
+
+    void refreshState() {
+        if (mState) mState->setValue(moneyModeText());
+        if (mLock)  mLock->setValue(moneyActive() ? "已开" : "已关");
     }
 
     void addPreset(tsl::elm::List* list, const char* label, u32 value) {
@@ -3338,6 +3575,7 @@ private:
     tsl::elm::OverlayFrame* mFrame = nullptr;
     tsl::elm::ListItem* mState  = nullptr;
     tsl::elm::ListItem* mAmount = nullptr;
+    tsl::elm::ListItem* mLock   = nullptr;
 };
 
 class TimeGui : public tsl::Gui {
@@ -3445,12 +3683,25 @@ public:
         auto* noteSave = new tsl::elm::ListItem("改完按「写入」才生效");
         noteSave->setValue("写入前只是待写值", true);
         list->addItem(noteSave);
-        auto* note1 = new tsl::elm::ListItem("只移动时钟，不触发日界");
+        auto* note1 = new tsl::elm::ListItem("改时钟不动日界");
         note1->setValue("作物不会因此生长", true);
         list->addItem(note1);
+        // The day row is not the same thing as the clock row, and saying so is
+        // the whole point of this row: a day write really does roll the
+        // calendar, and a 28 -> 1 rollover is where this console died once.
+        auto* noteDay = new tsl::elm::ListItem("改日期会真的跨月");
+        noteDay->setValue("28 日睡觉可能黑屏", true);
+        list->addItem(noteDay);
         auto* note2 = new tsl::elm::ListItem("写入后按新日期继续");
         note2->setValue("要回原值只能读档", true);
         list->addItem(note2);
+        // Without the native mod the clock row cannot do anything, and that
+        // failure used to be invisible.  The status string is the same one the
+        // request path writes, so this row answers "is the mod hooked up?"
+        // without opening the log.
+        mMod = new tsl::elm::ListItem("原生 mod");
+        mMod->setValue(gTimeReqStatus, true);
+        list->addItem(mMod);
         // The resolved pair, on screen.  Every "nothing happened" report so far
         // came down to which pair had been picked, and that answer lived only
         // in the log -- which nobody has when the page is in front of them.
@@ -3510,8 +3761,12 @@ private:
         logLine("date/time read: day=%u clock=%u (%s)", (unsigned)mSeenDay,
                 (unsigned)mSeenClock,
                 mSeenClock ? "hhmm" : "unreadable");
+        // Resolving the mod here means the page opens with an answer instead of
+        // "未测试" and a wait for the first write to find out.
+        findSubsdk();
         if (mCur)   mCur->setValue(curText());
         if (mDay)   mDay->setValue(dayText(gDay));
+        if (mMod)   mMod->setValue(gTimeReqStatus, true);
         refreshClockRows();
     }
 
@@ -3634,11 +3889,16 @@ private:
             setStatus(msg);
             return true;
         }
-        if (submitTimeRequest((int)v) && ok) {
-            char msg[48];
-            std::snprintf(msg, sizeof(msg), "已写入 %s", clockText(v).c_str());
-            setStatus(msg);
-        }
+        // Two independent results, and the subtitle can only show one.  A
+        // failed submit already put its own reason there (未找到 mod / 写时刻
+        // 失败), so success is the only case that earns a message here -- and
+        // only when the day write above did not already fail.
+        const bool clockOk = submitTimeRequest((int)v);
+        if (mMod) mMod->setValue(gTimeReqStatus, true);
+        if (!clockOk || !ok) return true;
+        char msg[48];
+        std::snprintf(msg, sizeof(msg), "已写入 %s", clockText(v).c_str());
+        setStatus(msg);
         return true;
     }
 
@@ -3648,6 +3908,7 @@ private:
     tsl::elm::ListItem* mHour  = nullptr;
     tsl::elm::ListItem* mMin   = nullptr;
     tsl::elm::ListItem* mSave  = nullptr;
+    tsl::elm::ListItem* mMod   = nullptr;
     u32 gDay   = 1;     // pending write, seeded from the last good read
     u32 gClock = 600;
     u32 mSeenDay   = 0; // last successful read, 0 when the field was unreadable
@@ -3717,7 +3978,7 @@ public:
         });
         list->addItem(enhance);
 
-        auto* money = new tsl::elm::ListItem("金钱", "任意金额，花不完");
+        auto* money = new tsl::elm::ListItem("金钱", "写入一次，照常花钱");
         money->setClickListener([](u64 keys) {
             if (!(keys & HidNpadButton_A)) return false;
             if (!attach()) return true;
