@@ -1,7 +1,13 @@
 # 星露谷物语（Switch）Mod — v1.4.2
 
+作者 **Banana**　·　来源仓库：<https://github.com/lisooreal0202-commits/stardew-switch-mod>
+
 给 Switch 版星露谷加自动化、拖拉机、地图标记、背包扩容，作物/机器/礼物提示，
 外加一个 Tesla 插件（物品、体力、金钱、日期时间、好感）和一个金手指（走路加速、自动钓鱼）。
+
+> **转载须知**：这个包可以自由转发，但请**整包转发**，不要删掉作者署名、
+> `README.md`、`LICENSE`、`NOTICE.md`，并注明上面的来源仓库。本 Mod 链接 GPLv2 的
+> exlaunch，删掉许可证与声明再分发属于侵权；改名后当成自己的作品发布尤其如此。
 
 <details>
 <summary><b>版本历史</b></summary>

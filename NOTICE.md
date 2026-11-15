@@ -1,5 +1,14 @@
 # Third-party notices
 
+## This mod
+
+Author: **Banana** -- <https://github.com/lisooreal0202-commits/stardew-switch-mod>
+
+Redistributing this package is fine.  Keep this file, `LICENSE`, the author
+line and the source link with it: the shipped `subsdk8` links GPLv2 code, so
+the licence and the source have to travel with the binary.  Removing them --
+or republishing under another name -- is a licence violation, not a "repost".
+
 ## exlaunch -- GPLv2
 
 This mod is built on [exlaunch](https://github.com/shadowninja108/exlaunch)
