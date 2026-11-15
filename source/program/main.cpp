@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 520;
+    constexpr int kBuildNo = 522;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -13741,6 +13741,14 @@ namespace {
      * slot" -- the same order the pond uses, and nothing touches the hut's own
      * harvest bookkeeping. */
     constexpr uintptr_t kJunimoHutUpdateOff = SDV_OFF(kJunimoHutUpdateOff, 0x1213260u);
+    /* v521: the farm shipping bin.  It is a Building (StardewValley.Buildings.
+     * ShippingBin : Building), so its own Update override is the per-frame
+     * handle that hands us its footprint -- the ponds' and huts' trick again.
+     * Farm.shipItem(Item, Farmer) is what the bin's menu calls when the player
+     * drops an item in, i.e. the game's own "accept this" path. */
+    constexpr uintptr_t kShippingBinUpdateOff = SDV_OFF(kShippingBinUpdateOff, 0x1217960u);
+    constexpr uintptr_t kGame1GetFarmOff       = SDV_OFF(kGame1GetFarmOff,       0x1464FF0u);
+    constexpr uintptr_t kFarmShipItemOff       = SDV_OFF(kFarmShipItemOff,       0x1398E20u);
     constexpr uintptr_t kHutOutputChestOff  = SDV_OFF(kHutOutputChestOff,  0x12120A0u);
     /* StardewValley.Inventories.Inventory's own methods (same object
      * Chest.GetItemsForPlayer returns; see v489). */
@@ -14211,6 +14219,16 @@ namespace {
     static int s_regHutW[16] = {};
     static int s_regHutH[16] = {};
     static int s_regHutCount = 0;
+    /* v521: shipping bins seen this pass (footprint only). */
+    static void (*s_origBinUpdate)(void*, void*) = nullptr;
+    constexpr int kRegMaxBins = 8;
+    static void* s_regBins[kRegMaxBins] = {};
+    static int s_regBinX[kRegMaxBins] = {};
+    static int s_regBinY[kRegMaxBins] = {};
+    static int s_regBinW[kRegMaxBins] = {};
+    static int s_regBinH[kRegMaxBins] = {};
+    static int s_regBinCount = 0;
+    static unsigned s_v521Ship = 0;
     static void (*s_origObjectUpdate)(void*, void*) = nullptr;
 
     /* Read / write a Net* field's value.  NetValueSlot already validates both
@@ -15517,6 +15535,188 @@ namespace {
         return ItemIdDigits(obj) == kCaskId;
     }
 
+    /* ---- v521: the shipping bin ------------------------------------------
+     *
+     * The bin is a Building, not an Object, so the machine groups never see it.
+     * It does not need to be one: Farm.shipItem(Item, Farmer) is exactly what
+     * the bin's own menu calls when the player drops an item in, and it accepts
+     * whatever the bin accepts (prices, stats and lastItemShipped included).
+     *
+     * So a chest that touches the bin's footprint has its leftovers shipped at
+     * the END of the pass -- after every machine in the group has had its
+     * chance to take them, which is the priority order the PC mod uses.
+     *
+     * Equipment (tools, weapons, rings, boots, clothing, trinkets: category
+     * -96 and below) is deliberately left alone.  A chest of gear must not be
+     * sold off just because it happens to stand next to the bin.
+     */
+    constexpr uintptr_t kShipItemCategoryOff =
+        SDV_OFF(kShipItemCategoryOff, 0x15AE7E0u);   /* Item.get_Category */
+
+    void RegAddBin(void* bin) {
+        if (s_regBinCount >= kRegMaxBins) {
+            return;
+        }
+        for (int i = 0; i < s_regBinCount; ++i) {
+            if (s_regBins[i] == bin) {
+                return;
+            }
+        }
+        void* tx = NetValueSlot(bin, kBuildingTileXOff, 4u);
+        void* ty = NetValueSlot(bin, kBuildingTileYOff, 4u);
+        void* tw = NetValueSlot(bin, kBuildingWideOff, 4u);
+        void* th = NetValueSlot(bin, kBuildingHighOff, 4u);
+        if (tx == nullptr || ty == nullptr || tw == nullptr || th == nullptr) {
+            return;
+        }
+        s_regBins[s_regBinCount] = bin;
+        s_regBinX[s_regBinCount] = *reinterpret_cast<int*>(tx);
+        s_regBinY[s_regBinCount] = *reinterpret_cast<int*>(ty);
+        s_regBinW[s_regBinCount] = *reinterpret_cast<int*>(tw);
+        s_regBinH[s_regBinCount] = *reinterpret_cast<int*>(th);
+        ++s_regBinCount;
+    }
+
+    void HookShippingBinUpdate(void* self, void* gameTime) {
+        if (AutomateOn() && s_collecting && self != nullptr) {
+            RegAddBin(self);
+        }
+        if (s_origBinUpdate != nullptr) {
+            s_origBinUpdate(self, gameTime);
+        }
+    }
+
+    /* Chest tile touching a building footprint in any of the eight directions. */
+    bool ChestTouchesBin(int cx, int cy, int x0, int y0, int w, int h) {
+        return cx >= x0 - 1 && cx <= x0 + w && cy >= y0 - 1 && cy <= y0 + h;
+    }
+
+    void ShipGroupLeftovers(void* here, void* pl) {
+        if (s_regBinCount == 0 || here == nullptr || pl == nullptr) {
+            return;
+        }
+        void* farm = reinterpret_cast<void* (*)(void*)>(g_base + kGame1GetFarmOff)(
+            nullptr);
+        if (farm == nullptr || farm != here) {
+            /* The bin only exists on the farm; the island farm is left alone on
+             * purpose (its bin is a different location object). */
+            return;
+        }
+        void* tfDict = TerrainDict();
+
+        /* v522: paths/floors connect the bin exactly like they connect machines.
+         *
+         * The walk is seeded with the bin's footprint and its one-tile ring (the
+         * ring is what makes plain adjacency work), then every connector tile
+         * extends it.  A registered chest that touches any visited tile -- the
+         * ring, a path tile, or a path tile further out -- is shipped.
+         *
+         * The wire test shares its terrain-lookup budget with the machine
+         * groups, so during a rebuild pass this walk may spend at most 48
+         * lookups; every other pass is cache-only and costs nothing. */
+        constexpr int kShipWalkMax = 128;
+        static int walk[kShipWalkMax];
+        int walkN = 0;
+        for (int b = 0; b < s_regBinCount; ++b) {
+            const int x0 = s_regBinX[b];
+            const int y0 = s_regBinY[b];
+            const int w = s_regBinW[b];
+            const int h = s_regBinH[b];
+            for (int y = y0 - 1; y <= y0 + h; ++y) {
+                for (int x = x0 - 1; x <= x0 + w; ++x) {
+                    if (walkN < kShipWalkMax) {
+                        walk[walkN++] = PackTile(static_cast<float>(x),
+                                                 static_cast<float>(y));
+                    }
+                }
+            }
+        }
+        int scans = s_connScan ? 48 : 0;
+        for (int i = 0; i < walkN; ++i) {
+            const int ax = static_cast<int>(
+                (static_cast<unsigned>(walk[i]) >> 16) & 0xFFFFu);
+            const int ay = static_cast<int>(
+                static_cast<unsigned>(walk[i]) & 0xFFFFu);
+            static const int ddx[4] = {1, -1, 0, 0};
+            static const int ddy[4] = {0, 0, 1, -1};
+            for (int d = 0; d < 4 && walkN < kShipWalkMax; ++d) {
+                const int nx = ax + ddx[d];
+                const int ny = ay + ddy[d];
+                const int key = PackTile(static_cast<float>(nx),
+                                         static_cast<float>(ny));
+                bool seen = false;
+                for (int k = 0; k < walkN && !seen; ++k) {
+                    seen = (walk[k] == key);
+                }
+                if (seen) {
+                    continue;
+                }
+                if (s_connScan) {
+                    if (scans <= 0) {
+                        continue;           /* budget spent for this pass */
+                    }
+                    --scans;
+                }
+                if (ConnectorAt(tfDict, static_cast<float>(nx),
+                                static_cast<float>(ny))) {
+                    walk[walkN++] = key;
+                }
+            }
+        }
+
+        auto shipItem = reinterpret_cast<void (*)(void*, void*, void*)>(
+            g_base + kFarmShipItemOff);
+        auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
+        auto getCount = reinterpret_cast<int (*)(void*)>(g_base + kInvCountOff);
+        auto getItem = reinterpret_cast<void* (*)(void*, int)>(g_base + kInvGetItemOff);
+        auto setItem = reinterpret_cast<void (*)(void*, int, void*)>(g_base + kInvSetItemOff);
+        auto category = reinterpret_cast<int (*)(void*)>(
+            g_base + kShipItemCategoryOff);
+        int shipped = 0;
+        for (int i = 0; i < walkN && shipped < 96; ++i) {
+            const int ax = static_cast<int>(
+                (static_cast<unsigned>(walk[i]) >> 16) & 0xFFFFu);
+            const int ay = static_cast<int>(
+                static_cast<unsigned>(walk[i]) & 0xFFFFu);
+            for (int c = 0; c < s_regChestCount && shipped < 96; ++c) {
+                const int cx = static_cast<int>(s_regChestX[c]);
+                const int cy = static_cast<int>(s_regChestY[c]);
+                if (cx < ax - 1 || cx > ax + 1 || cy < ay - 1 || cy > ay + 1) {
+                    continue;
+                }
+                void* chest = s_regChests[c];
+                if (chest == nullptr || !Plausible(chest)) {
+                    continue;
+                }
+                void* inv = getItems(chest);
+                if (inv == nullptr || !Plausible(inv)) {
+                    continue;
+                }
+                const int n = getCount(inv);
+                for (int s = 0; s < n && shipped < 96; ++s) {
+                    void* item = getItem(inv, s);
+                    if (item == nullptr || !Plausible(item)) {
+                        continue;
+                    }
+                    if (category(item) <= -96) {
+                        continue;           /* equipment stays in the chest */
+                    }
+                    shipItem(farm, item, pl);
+                    setItem(inv, s, nullptr);
+                    ++shipped;
+                }
+            }
+        }
+        if (shipped > 0 && s_autoOutput < 0xFu) {
+            ++s_autoOutput;
+        }
+        if (s_v521Ship < 4u) {
+            ++s_v521Ship;
+            LOGF("v522 ship: %d item(s), bins=%d walk=%d chests=%d", shipped,
+                 s_regBinCount, walkN, s_regChestCount);
+        }
+    }
+
     void RunAutomation() {
         s_dbgRegChests = static_cast<unsigned>(s_regChestCount);
         s_dbgRegMachines = static_cast<unsigned>(s_regMachineCount);
@@ -15577,7 +15777,9 @@ namespace {
             }
         }
 
-        if (s_regChestCount == 0 || s_regMachineCount == 0) {
+        /* v522: a chest, a path and the bin is a valid setup with no machine in
+         * it at all, so only the chest count gates the pass now. */
+        if (s_regChestCount == 0) {
             return;
         }
         void* pl = CarryPlayer();
@@ -15742,6 +15944,9 @@ namespace {
         CollectPonds();
         /* v490: same shape for Junimo huts, from their own output chest. */
         CollectHuts();
+        /* v521: and finally the shipping bin, so items a machine could still
+         * take are never sold. */
+        ShipGroupLeftovers(locNow, pl);
 
         if (kAutomateLog) {
             LOGF("auto: pass end");
@@ -15780,6 +15985,7 @@ namespace {
             s_regMachineCount = 0;
             s_regPondCount = 0;
             s_regHutCount = 0;
+            s_regBinCount = 0;
             s_collecting = true;
             /* Written BEFORE the object walk of the next frame.  If the log
              * ends on this line the crash was inside the walk (our harvest
@@ -24995,6 +25201,7 @@ extern "C" void exl_main(void* x0, void* x1) {
         { 0x019DF2D0u, 0xD10303FFu, 0x6D0523E9u },
         { 0x0120AE00u, 0xD101C3FFu, 0x6D0223E9u },
         { 0x01213260u, 0xA9BE7BFDu, 0xA9014FF4u },
+        { 0x01217960u, 0xD10343FFu, 0xA9097BFDu },
         { 0x014500A0u, 0xD10543FFu, 0xA9107BFDu },
         { 0x003943F0u, 0x17FFFFA4u, 0x00000000u },
         { 0x0181D1F0u, 0xD10683FFu, 0x6D1133EDu },
@@ -25114,6 +25321,11 @@ extern "C" void exl_main(void* x0, void* x1) {
             HOOKF(base + kJunimoHutUpdateOff, &HookJunimoHutUpdate, true));
         LOGF("automate: junimo hut hook %p",
              reinterpret_cast<void*>(s_origHutUpdate));
+        /* v521: the shipping bin, same per-frame Building hook idea. */
+        s_origBinUpdate = reinterpret_cast<void (*)(void*, void*)>(
+            HOOKF(base + kShippingBinUpdateOff, &HookShippingBinUpdate, true));
+        LOGF("automate: shipping bin hook %p",
+             reinterpret_cast<void*>(s_origBinUpdate));
     }
 
     /* stage 2c: per-frame auto tool use while driving.
