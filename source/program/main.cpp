@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 474;
+    constexpr int kBuildNo = 480;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -12516,19 +12516,72 @@ namespace {
         ok = PatchWord(0x17B35B8u, 0x12800006u, 0x52800486u) && ok;  /* ItemGrabMenu chest grid */
         ok = PatchWord(0x17B44B8u, 0x12800006u, 0x52800486u) && ok;  /* ItemGrabMenu chest grid (resize) */
 
-        /* ---- 1c. ShopMenu: the panel grows by 64, the coin box follows - */
-        /* ShopMenu builds its player grid at a hard-coded `y + 496`
-         * (96 + 40 + 320 + 40), so four rows reach `y + 768`; the brown panel
-         * behind it is `height - 448 + 20`, sized for three rows.  Grow the
-         * panel by one row (0x1830068 `sub w25, w12, #0x1AC` -> `#0x16C`,
-         * i.e. 252 -> 316) and move the money box that drawCurrency places at
-         * `y + height - inventory.height - 12` down by the same 64
-         * (0x182F734 `sub w3, w9, #0xC` -> `add w3, w9, #0x34`, -12 -> +52).
+        /* ---- 1c. ShopMenu: the panel grows by 64, the coin box drops out - */
+        /* ShopMenu builds its player grid from `y + 360 + <global>` (the y
+         * handed to InventoryMenu..ctor at 0x1823960) and the brown panel
+         * behind it is `height - 448 + 20`, sized for three rows.  With four
+         * rows the panel has to grow by one row; it grows by 0x1AC - 0x190 =
+         * 28 instead of a full 64, and the grid moves 16 up (0x1823928), so
+         * the panel ends at `y + height + 64` (see 1d below).
+         *
+         * The coin box is drawn by ShopMenu.draw ITSELF, at 0x1830EEC:
+         *     0x1830ED4  ldp  w8, w9, [x28, #0x28] ; x, y
+         *     0x1830ED8  sub  w2, w8, #0x24        ; box x = x - 36
+         *     0x1830EE0  add  w8, w9, w8           ; y + height
+         *     0x1830EE4  sub  w8, w8, w10          ; - inventory.height
+         *     0x1830EE8  sub  w3, w8, #0xC         ; <- THIS instruction
+         *     0x1830EEC  bl   0x1776550            ; draw the box
+         * Vanilla's 208-tall grid puts the box at `y + height - 220`, which is
+         * exactly the shop frame's bottom edge (`0x18300F0 sub w25, w8, #0xDC`),
+         * so it hangs half under the frame's bottom border.  With a 272-tall
+         * grid the vanilla formula would lift it another 64.
+         *
+         * Pin it 32px BELOW the frame's bottom edge instead:
+         * `add w3, w8, #0x54` (0x51003103 -> 0x11015103), i.e.
+         * `y + height - inventory.height + 84`.  With the 272-tall grid that
+         * is `y + height - 188`, which is 32 past the frame's `-220`.
+         * The box is `x - 36 .. x + 164`, the backpack panel starts at
+         * `x + 256`, so the two never touch.
+         *
+         * v474/v475 patched 0x182F734 instead -- that is the standalone
+         * `ShopMenu.drawCurrency` (0x182F6C0), and the shop's own draw does
+         * NOT call it: the compiler inlined a private copy into ShopMenu.draw,
+         * which is the one that reaches the screen.  That is why the coin box
+         * never moved; the patch was a no-op with respect to what is drawn.
+         * The PC mod patches drawCurrency at the IL level, where there is only
+         * one copy.
+         *
          * The PC mod patches three more ShopMenu sites; they are identities
          * in this build and would only give the fingerprint guard something to
          * reject. */
         ok = PatchInstr(0x1830068u, 0x5106B199u, 0x16Cu, 10, 0xFFFu) && ok;
-        ok = PatchWord(0x182F734u, 0x51003123u, 0x1100D123u) && ok;
+        ok = PatchWord(0x1830EE8u, 0x51003103u, 0x11015103u) && ok;
+
+        /* ---- 1d. ShopMenu: lift the menu 48px so the bottom row fits --- */
+        /* 0x18247B0 (ShopMenu's layout pass, called from the ctor at
+         * 0x182384C and from Initialize at 0x182FA14) centres the menu:
+         *     0x18247F0  add  w8, w8, #0x258   ; height = 600 + borderWidth*2
+         *     0x182483C  asr  w8, w8, #1       ; viewport height / 2
+         *     0x1824844  add  w9, w9, #0x258   ; <- centring copy (NOT the
+         *     0x1824848  sub  w8, w8, w9, asr #1 ;    height field below)
+         *     0x182484C  str  w8, [x19, #0x2c] ; yPositionOnScreen
+         * Four rows reach `y + 752` and the panel `y + 780`, one row more
+         * than the screen has room for under the frame.  Feeding the centring
+         * math 696 instead of 600 (0x11096129 -> 0x110AE129) gives
+         * `y = vh/2 - height/2 - 48`, i.e. the whole shop -- frame, grid,
+         * panel, coin box -- rides three quarters of a row higher; the real
+         * height field (0x18247F0) is untouched, so nothing inside the menu
+         * shifts.
+         *
+         * Amounts tried on hardware: 64 (0x2D8) too high -- the frame hit the
+         * screen's top edge and the greeting got cut; 32 (0x298) not enough,
+         * the block still leaned low; 48 (0x2B8) is the middle of the two.
+         *
+         * v479 tried to drop the lift and shorten the panel instead.  That
+         * pushed the player's fourth row past the panel's bottom border (shot
+         * in the report) and the shopkeeper greeting disappeared, so the lift
+         * is back and the panel keeps its full one-row-extra height. */
+        ok = PatchWord(0x1824844u, 0x11096129u, 0x110AE129u) && ok;
 
         /* ---- 2. the brown box: page height +64 ------------------------ */
         /* GameMenu.draw does
