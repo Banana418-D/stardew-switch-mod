@@ -131,7 +131,7 @@ constexpr u64 kTitleId     = 0x0100E65002BB8000ULL;   // Stardew Valley
 // movz/movk pair instead of landing in .rodata, which makes "did this build
 // pick up my version string?" impossible to answer with strings(1).
 constexpr const char* kBuild = "v1.0.8";
-constexpr int         kBuildSeq = 20;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, ...
+constexpr int         kBuildSeq = 21;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, ...
 // One round of "record the memory layout, touch nothing".  Flip to false once the
 // chain under 0x0BB90280 is understood.
 constexpr bool kDiagOnly = false;
@@ -1929,6 +1929,7 @@ bool findSubsdk() {
     }
     MemoryInfo chunk[32];
     u64 off = 0;
+    int cands = 0;
     while (off < total) {
         u64 got = 0;
         if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
@@ -1950,7 +1951,10 @@ bool findSubsdk() {
                 continue;
             if (tag[0] != 'M' || tag[1] != 'O' || tag[2] != 'D' || tag[3] != '0')
                 continue;
+            ++cands;
             const u64 slot = scanSlotIn(m.addr);
+            logLine("subsdk: candidate %016llX slot %016llX",
+                    (unsigned long long)m.addr, (unsigned long long)slot);
             if (!slot) continue;
             gSubsdkBase  = m.addr;
             gTimeReqSlot = slot;
@@ -1961,16 +1965,34 @@ bool findSubsdk() {
         }
         off += got;
     }
-    std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "未找到 mod");
-    logError("subsdk: no module carries the %s marker", "SDV-SETTIME-01");
+    // Two different failures, two different fixes: no exlaunch module at all
+    // means the native mod is not installed; a module without the marker means
+    // the installed one is older than the request slot.  Saying "not found"
+    // for both is what sent the first report of this in the wrong direction.
+    if (cands == 0) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "未找到 mod");
+        logError("subsdk: no exlaunch module in the process (nothing starts with "
+                 "b #0x20) -- the native mod is not installed");
+    } else {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "mod 版本旧");
+        logError("subsdk: %d exlaunch module(s), none carries the %s marker -- "
+                 "the installed mod predates the request slot",
+                 cands, "SDV-SETTIME-01");
+    }
     return false;
 }
 
 // Odd/even seqlock: odd seq means "being written", even means "published".
-bool submitTimeRequest(int hhmm) {
+//
+// The return value separates "there is no slot to write to" from "the write
+// itself failed": the caller falls back to a plain field write only in the
+// first case.
+enum TimeSubmit : u8 { kTimeOk = 0, kTimeNoSlot = 1, kTimeFailed = 2 };
+
+TimeSubmit submitTimeRequest(int hhmm) {
     if (!findSubsdk()) {
-        setStatus("未找到 mod");
-        return false;
+        setStatus(gTimeReqStatus);
+        return kTimeNoSlot;
     }
     const u64 slot = gTimeReqSlot;
 
@@ -1980,7 +2002,7 @@ bool submitTimeRequest(int hhmm) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读 seq 失败");
         logError("time: seq at %016llX unreadable", (unsigned long long)addr);
         setStatus("读进度失败");
-        return false;
+        return kTimeFailed;
     }
     const u32 even = (seq + 2u) & ~1u;
     const u32 odd  = even - 1u;
@@ -1990,26 +2012,26 @@ bool submitTimeRequest(int hhmm) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(奇) 失败");
         logError("time: seq write (odd) failed");
         setStatus("写进度失败");
-        return false;
+        return kTimeFailed;
     }
     if (!pokeAbs(addr + 4, &tgt, 4)) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 target 失败");
         logError("time: target write failed (slot %016llX)",
                  (unsigned long long)slot);
         setStatus("写时刻失败");
-        return false;
+        return kTimeFailed;
     }
     if (!pokeAbs(addr, &even, 4)) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(偶) 失败");
         logError("time: seq write (even) failed");
         setStatus("写进度失败");
-        return false;
+        return kTimeFailed;
     }
     std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus),
                   "已提交 %d seq %u->%u", hhmm, seq, even);
     logLine("time: request %d seq %u->%u slot %016llX", hhmm, seq, even,
             (unsigned long long)slot);
-    return true;
+    return kTimeOk;
 }
 
 // peek() adds the module base; a MonoString object lives on the managed heap at
@@ -3890,12 +3912,31 @@ private:
             return true;
         }
         // Two independent results, and the subtitle can only show one.  A
-        // failed submit already put its own reason there (未找到 mod / 写时刻
+        // failed submit already put its own reason there (读进度失败 / 写时刻
         // 失败), so success is the only case that earns a message here -- and
         // only when the day write above did not already fail.
-        const bool clockOk = submitTimeRequest((int)v);
+        const TimeSubmit r = submitTimeRequest((int)v);
         if (mMod) mMod->setValue(gTimeReqStatus, true);
-        if (!clockOk || !ok) return true;
+        if (r == kTimeNoSlot) {
+            // No request slot: write the field the way every build before the
+            // slot did.  The clock moves immediately, but the game's own
+            // per-ten-minute work (HUD, music, menus, farmer) waits for the
+            // next natural tick -- that is the trade, and the 原生 mod row says
+            // which of the two paths this press took.
+            const DateFields f = dateFields();
+            if (!f.time) {
+                setStatus("找不到时间字段");
+                logError("time: no slot and no resolved timeOfDay field");
+                return true;
+            }
+            if (writeField(f.time, v) && ok) {
+                logLine("time: no request slot, wrote timeOfDay directly at %08X "
+                        "(world state not advanced)", (unsigned)f.time);
+                setStatus("直写生效");
+            }
+            return true;
+        }
+        if (r == kTimeFailed || !ok) return true;
         char msg[48];
         std::snprintf(msg, sizeof(msg), "已写入 %s", clockText(v).c_str());
         setStatus(msg);
