@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 494;
+    constexpr int kBuildNo = 507;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -2350,6 +2350,12 @@ namespace {
      * Game1.objectSpriteSheet and its name -- -1 / null when it is not a
      * vanilla crop (or the read failed).  Written by the probe, read by the
      * draw and by the string builder. */
+    static const char16_t g_bushNameTea[] = u"\u8336\u6811";        /* 茶树 */
+    static const char16_t g_bushNameBerry[] = u"\u6D46\u679C\u4E1B"; /* 浆果丛 */
+    static const char16_t g_fruitTreeName[] = u"\u679C\u6811";      /* 果树 */
+    static const char16_t g_giantCropName[] = u"\u5DE8\u5927\u4F5C\u7269"; /* 巨大作物 */
+    /* v499: fruit count / bush size for the extra tile probes. */
+    static int s_cropCount = 0;
     static int s_cropId = -1;
     static int s_cropSprite = -1;
     static int s_cropSheet = 0;         /* 0 = objectSpriteSheet, 1 = _2 */
@@ -14825,6 +14831,12 @@ namespace {
      * Cheap enough to run every frame, but it is throttled by tile anyway: the
      * only managed call on the path (FeatureNameIs -> ToString) runs until the
      * HoeDirt klass is cached, and that must not happen 60 times a second. */
+    /* v499: defined further down, next to the tile-probe helpers (they need the
+     * v482 constants: bush slots, garden-pot access, VSlot). */
+    bool ProbeOtherFacing(int tx, int ty, void* here, void* dict);
+    void* PotDirt(void* obj);
+    void* ObjAt(void* here, int tx, int ty);
+
     void ProbeFacingCrop() {
         s_cropDbg = 0;
         s_cropFlags = 0;
@@ -14866,13 +14878,40 @@ namespace {
                 dict, static_cast<float>(tx), static_cast<float>(ty),
                 &feature) ||
             feature == nullptr) {
-            s_cropDbg = 3;                    /* bare ground */
-            return;
+            /* v499: no terrain feature -- it may still be a garden pot (the crop
+             * lives inside the pot object, not in terrainFeatures), or a bush /
+             * fruit tree / giant crop, which are reported by their own probe. */
+            void* here0 = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+            void* potDirt = nullptr;
+            if (here0 != nullptr && Plausible(here0)) {
+                void* obj = ObjAt(here0, tx, ty);
+                if (obj != nullptr) {
+                    potDirt = PotDirt(obj);
+                }
+            }
+            if (potDirt != nullptr) {
+                feature = potDirt;            /* same path as tilled soil */
+                if (s_cropDbg < 20u) {
+                    s_cropDbg = 20u;          /* diag: pot */
+                }
+            }
+            else {
+                if (ProbeOtherFacing(tx, ty, here0, dict)) {
+                    return;
+                }
+                s_cropDbg = 3;                /* bare ground */
+                return;
+            }
         }
-        feature = UnwrapFeature(feature);
-        if (!IsHoeDirtFeature(feature)) {
-            s_cropDbg = 4;                    /* not tilled */
-            return;
+        else {
+            feature = UnwrapFeature(feature);
+            if (!IsHoeDirtFeature(feature)) {
+                if (ProbeOtherFacing(tx, ty, nullptr, dict)) {
+                    return;
+                }
+                s_cropDbg = 4;                /* not tilled */
+                return;
+            }
         }
         int state = 0;
         if (NetIntAt(feature, kHoeDirtStateOff, &state) && state == 1) {
@@ -17020,8 +17059,12 @@ namespace {
         if (LocationIsOutdoors(loc)) {
             return true;
         }
+        /* v506: the greenhouse is the one indoor map with tilled soil, so the
+         * tractor belongs there too.  Houses, shops and festivals stay refused:
+         * a horse written into their save would greet the player at the counter. */
         return LocationNameStartsWith(loc, "UndergroundMine") ||
-               LocationNameStartsWith(loc, "Volcano");
+               LocationNameStartsWith(loc, "Volcano") ||
+               LocationNameStartsWith(loc, "Greenhouse");
     }
 
     bool AdoptTractor(void* here, void* horse) {
@@ -18188,6 +18231,154 @@ namespace {
             did = true;
         }
         return did;
+    }
+
+    /* v499: the tile in front is not tilled soil.  Report the three other
+     * things that grow: a fruit tree (how many fruit), a berry/tea bush (ripe or
+     * not) and a giant crop (ready to be chopped).  All of them fill the same
+     * s_crop* slots with a "kind" in flags bits 4..6, so the label builder only
+     * needs one extra branch.
+     *
+     * The ripeness test is tileSheetOffset == 1, NOT Bush.isActionable (which is
+     * a `mov w0,#1; ret` stub in this build -- see the v497 note). */
+    bool ProbeOtherFacing(int tx, int ty, void* here, void* dict) {
+        if (here == nullptr || !Plausible(here)) {
+            here = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        }
+        if (here == nullptr || !Plausible(here)) {
+            return false;
+        }
+        /* ---- bush: exact tile match in largeTerrainFeatures ---- */
+        void* nc = nullptr;
+        if (RangeReadable(static_cast<char*>(here) + kLargeTerrainOff,
+                          sizeof(void*))) {
+            nc = *reinterpret_cast<void**>(static_cast<char*>(here) + kLargeTerrainOff);
+        }
+        if (nc != nullptr && Plausible(nc) &&
+            RangeReadable(static_cast<char*>(nc) + kNetDictInnerOff, sizeof(void*))) {
+            void* list = *reinterpret_cast<void**>(static_cast<char*>(nc) + kNetDictInnerOff);
+            void** items = nullptr;
+            int count = 0;
+            if (ReadListRaw(list, &items, &count)) {
+                void* bushBody = reinterpret_cast<void*>(g_base + kBushUseBodyOff);
+                for (int i = 0; i < count && i < 4096; ++i) {
+                    void* b = items[i];
+                    if (b == nullptr || !Plausible(b)) {
+                        continue;
+                    }
+                    if (VSlot(b, kTfUseActionSlotOff) != bushBody) {
+                        continue;
+                    }
+                    /* v500: bushes are 2x2 and Tile is only the base tile, so
+                     * the faced tile is tested against the bounding box --
+                     * vanilla's checkAction does the same. */
+                    void* boxFn = VSlot(b, kTfBoxSlotOff);
+                    if (boxFn == nullptr) {
+                        continue;
+                    }
+                    const Rect4i r = reinterpret_cast<Rect4i (*)(void*)>(boxFn)(b);
+                    if (!(r.x < tx * 64 + 64 && tx * 64 < r.x + r.w &&
+                          r.y < ty * 64 + 64 && ty * 64 < r.y + r.h)) {
+                        continue;
+                    }
+                    int size = 0;
+                    int sheet = 0;
+                    (void)NetIntAt(b, 0x40u, &size);
+                    (void)NetIntAt(b, 0x50u, &sheet);
+                    s_cropFlags = 1u | (2u << 4) | ((sheet == 1 ? 1u : 0u) << 8);
+                    s_cropCount = size;
+                    s_cropName = (size == 3) ? g_bushNameTea : g_bushNameBerry;
+                    return true;
+                }
+            }
+        }
+        /* ---- fruit tree: the feature slot tells us the class ---- */
+        void* feature = nullptr;
+        if (dict != nullptr &&
+            reinterpret_cast<bool (*)(void*, float, float, void**)>(
+                g_base + kTapperTryGetOff)(
+                dict, static_cast<float>(tx), static_cast<float>(ty), &feature) &&
+            feature != nullptr) {
+            feature = UnwrapFeature(feature);
+            /* v500: a bush may also be handed to us through terrainFeatures
+             * (LargeTerrainFeature derives from TerrainFeature); accept it here
+             * so the label works even if the largeTerrainFeatures walk does
+             * not. */
+            if (VSlot(feature, kTfUseActionSlotOff) ==
+                reinterpret_cast<void*>(g_base + kBushUseBodyOff)) {
+                int size = 0;
+                int sheet = 0;
+                (void)NetIntAt(feature, 0x40u, &size);
+                (void)NetIntAt(feature, 0x50u, &sheet);
+                s_cropFlags = 1u | (2u << 4) | ((sheet == 1 ? 1u : 0u) << 8);
+                s_cropCount = size;
+                s_cropName = (size == 3) ? g_bushNameTea : g_bushNameBerry;
+                return true;
+            }
+            if (VSlot(feature, kTfUseActionSlotOff) ==
+                reinterpret_cast<void*>(g_base + kFruitTreeUseBodyOff)) {
+                int n = 0;
+                void* ref = nullptr;
+                if (RangeReadable(static_cast<char*>(feature) + 0x68u, sizeof(void*))) {
+                    ref = *reinterpret_cast<void**>(static_cast<char*>(feature) + 0x68u);
+                }
+                if (ref != nullptr && Plausible(ref) &&
+                    RangeReadable(static_cast<char*>(ref) + 0x50u, sizeof(void*))) {
+                    void* cnt = *reinterpret_cast<void**>(static_cast<char*>(ref) + 0x50u);
+                    if (cnt != nullptr && Plausible(cnt) &&
+                        RangeReadable(static_cast<char*>(cnt) + kNetValueOff2, 4u)) {
+                        n = *reinterpret_cast<int*>(static_cast<char*>(cnt) + kNetValueOff2);
+                    }
+                }
+                if (n < 0) {
+                    n = 0;
+                }
+                if (n > 15) {
+                    n = 15;
+                }
+                s_cropFlags = 1u | (1u << 4) | ((n > 0 ? 1u : 0u) << 8);
+                s_cropCount = n;
+                s_cropName = g_fruitTreeName;
+                return true;
+            }
+        }
+        /* ---- giant crop: a resource clump whose tool slot is GiantCrop's ---- */
+        if (RangeReadable(static_cast<char*>(here) + kResourceClumpsOff, sizeof(void*))) {
+            void* cl = *reinterpret_cast<void**>(static_cast<char*>(here) + kResourceClumpsOff);
+            if (cl != nullptr && Plausible(cl) &&
+                RangeReadable(static_cast<char*>(cl) + kNetDictInnerOff, sizeof(void*))) {
+                void* list = *reinterpret_cast<void**>(static_cast<char*>(cl) + kNetDictInnerOff);
+                void** items = nullptr;
+                int count = 0;
+                if (ReadListRaw(list, &items, &count)) {
+                    void* giantBody = reinterpret_cast<void*>(g_base + 0x1B108B0u);
+                    for (int i = 0; i < count && i < 64; ++i) {
+                        void* gp = items[i];
+                        if (gp == nullptr || !Plausible(gp)) {
+                            continue;
+                        }
+                        void* tool = VSlot(gp, kTfToolActionSlotOff);
+                        if (tool != giantBody) {
+                            continue;
+                        }
+                        void* boxFn = VSlot(gp, kTfBoxSlotOff);
+                        if (boxFn == nullptr) {
+                            continue;
+                        }
+                        const Rect4i r = reinterpret_cast<Rect4i (*)(void*)>(boxFn)(gp);
+                        const int px = tx * 64;
+                        const int py = ty * 64;
+                        if (r.x <= px && px < r.x + r.w && r.y <= py &&
+                            py < r.y + r.h) {
+                            s_cropFlags = 1u | (3u << 4) | (1u << 8);
+                            s_cropName = g_giantCropName;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /* Is this object a garden pot with a HoeDirt inside?  The pot is an
@@ -22094,10 +22285,16 @@ namespace {
              * can hold different crops with the same day count and the same
              * watering state, and the name and icon have to follow the tile.
              * 0xFFFF marks "no crop", which cannot collide with a real id. */
+            /* v499: the kind (fruit tree / bush / giant crop) and "has fruit"
+             * live in the high flag bits, so they are folded in here too --
+             * otherwise moving from a ripe bush to an unripe one with the same
+             * tile id would keep the old label. */
+            const unsigned cropKind = (s_cropFlags >> 4) & 7u;
             const unsigned sig =
                 ((static_cast<unsigned>(s_cropId < 0 ? 0xFFFF : s_cropId) &
                   0xFFFFu) << 16) |
-                (s_cropFlags << 8) |
+                (((s_cropFlags & 0xFu) | (cropKind << 4) |
+                  ((s_cropCount > 0) ? 0x80u : 0u)) << 8) |
                 (static_cast<unsigned>(s_cropDays < 0 ? 0xFEu : s_cropDays) &
                  0xFFu);
             if (g_cropOn == 0) {
@@ -22112,7 +22309,68 @@ namespace {
                      (s_cropShow != 0 && !CachedStrOk(s_cropLine))) {
                 s_cropSig = sig;
                 s_cropShow = 0;
-                if ((s_cropFlags & 1u) != 0) {
+                if (cropKind != 0) {
+                    /* v499: fruit tree (1), bush (2), giant crop (3).  Name on
+                     * line 1, state on line 2, no icon -- the icon plumbing is
+                     * per item and these three do not need it to be useful. */
+                    static const char16_t kReady[] = u"\u53EF\u91C7\u6458";   /* 可采摘 */
+                    static const char16_t kUnripe[] = u"\u672A\u6210\u719F";  /* 未成熟 */
+                    static const char16_t kChop[] = u"\u53EF\u780D\u4F10";    /* 可砍伐 */
+                    static const char16_t kNoFruit[] = u"\u65E0\u679C";        /* 无果 */
+                    char16_t state[16];
+                    int sl = 0;
+                    if (cropKind == 1u) {
+                        if (s_cropCount > 0) {
+                            sl = AppendUnsigned(state, sl,
+                                                static_cast<unsigned>(s_cropCount));
+                            state[sl++] = u' ';
+                            state[sl++] = u'\u4E2A';                        /* 个 */
+                        }
+                        else {
+                            for (int i = 0; kNoFruit[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kNoFruit[i];
+                            }
+                        }
+                    }
+                    else if (cropKind == 2u) {
+                        const char16_t* st =
+                            (s_cropFlags & 0x100u) != 0 ? kReady : kUnripe;
+                        for (int i = 0; st[i] != 0 && sl < 12; ++i) {
+                            state[sl++] = st[i];
+                        }
+                    }
+                    else {
+                        for (int i = 0; kChop[i] != 0 && sl < 12; ++i) {
+                            state[sl++] = kChop[i];
+                        }
+                    }
+                    char16_t buf[32];
+                    int c = 0;
+                    if (s_cropName != nullptr) {
+                        for (int i = 0; s_cropName[i] != 0 && c < 10; ++i) {
+                            buf[c++] = s_cropName[i];
+                        }
+                    }
+                    const int line1 = c;
+                    buf[c++] = u'\n';
+                    for (int i = 0; i < sl && c < 30; ++i) {
+                        buf[c++] = state[i];
+                    }
+                    buf[c] = 0;
+                    CachedStrBuild(&s_cropLine, buf, c);
+                    int u1 = 0;
+                    int u2 = 0;
+                    for (int i = 0; i < line1; ++i) {
+                        u1 += CropCharUnits(buf[i]);
+                    }
+                    for (int i = line1 + 1; i < c; ++i) {
+                        u2 += CropCharUnits(buf[i]);
+                    }
+                    s_cropW = u1 > u2 ? u1 : u2;
+                    s_cropIconSheet = nullptr;
+                    s_cropShow = 1;
+                }
+                else if ((s_cropFlags & 1u) != 0) {
                     /* v451: three facts, two lines.
                      *
                      *   [icon] 防风草
