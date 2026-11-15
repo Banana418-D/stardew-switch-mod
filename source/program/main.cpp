@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 480;
+    constexpr int kBuildNo = 482;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -2254,6 +2254,20 @@ namespace {
      * s_scytheCalls counts issued Grass.performToolAction calls. */
     static unsigned s_scytheStage = 0;
     static unsigned s_scytheCalls = 0;
+    /* v482: the scythe gained crops, trees, fruit trees, bushes and spawned
+     * pickups.  Each helper logs its first few successes only -- enough to tell
+     * "never ran" from "ran and refused" without drowning the log in a field
+     * of crops. */
+    static unsigned s_v482Crop = 0;
+    static unsigned s_v482Tree = 0;
+    static unsigned s_v482Bush = 0;
+    static unsigned s_v482Pickup = 0;
+    /* v483: capped clump readout (see LogClumps). */
+    static unsigned s_v483Clump = 0;
+    /* v484: capped scythe/crop readout. */
+    static unsigned s_v484Seen = 0;
+    static unsigned s_v484Crop = 0;
+    static unsigned s_v484Fb = 0;
     /* v336 diagnostic: which gate refused the last qualifying chest hit
      * (Carry Chest).  One row on the world-map readout, eight nibbles:
      *   7 calls   how many times Chest.HandleChestHit reached our hook
@@ -17392,6 +17406,594 @@ namespace {
             static_cast<char*>(mountRef) + kNetValueOff2));
     }
 
+    /* ==================== v482: the scythe, part two =====================
+     *
+     * Until v481 the scythe only did two things: cut Grass terrain features and
+     * clear weed Objects.  The PC mod (Pathoschild's TractorMod,
+     * ScytheAttachment.cs) does a lot more, and all of it is missing here:
+     *
+     *     spawned forage      -> GameLocation.checkAction(tile)
+     *     crop / garden pot   -> Crop.harvest + HoeDirt.destroyCrop
+     *     fruit tree          -> FruitTree.performUseAction
+     *     tree seeds / moss   -> Tree.performUseAction / Tree.performToolAction
+     *     tea & berry bushes  -> Bush.performUseAction (largeTerrainFeatures)
+     *
+     * Why not simply call HoeDirt.performUseAction and let the game harvest?
+     * Because that function is the *player* path: it sets Farmer.CanMove =
+     * false, UsingTool = true and canReleaseTool = false to play the stoop
+     * animation.  Wedging the player that way is exactly what stopped
+     * auto-use in v263.  So the crop is harvested the way the PC mod does it:
+     * call Crop.harvest ourselves and then destroy the plant.  The dead-crop
+     * case clears the tile without harvesting anything.
+     *
+     * Layout / entry points, all from this build's own AOT metadata
+     * (.tmp/symtab_full.json, i.e. data/update-E7F84509), not from the other
+     * build the older notes used:
+     *
+     *   TerrainFeature.performUseAction     vtable slot 0x110
+     *       (0x120 is performToolAction -- verified in v297)
+     *   TerrainFeature.performUseAction bodies:
+     *       HoeDirt   0x1B19820     Tree     0x1B25EB0
+     *       FruitTree 0x1B09B60     Bush     0x1B00790
+     *   HoeDirt.crop           +0x30  NetRef<Crop>, value at +0x68
+     *   Crop.dead              +0x80  NetBool, value at +0x68
+     *   Crop.forageCrop        +0x88  NetBool, value at +0x68
+     *   Tree.tapped            +0x70  NetBool
+     *   Tree.hasSeed           +0x78  NetBool
+     *   Tree.hasMoss           +0x80  NetBool
+     *   Object.isSpawnedObject +0xC8  NetBool
+     *   IndoorPot.hoeDirt      +0x218 NetRef<HoeDirt>
+     *   Crop.harvest                 0x1264D30 (x, y, dirt, junimo, bool)
+     *   Crop.hitWithHoe              0x1264830 (x, y, location, dirt)
+     *   HoeDirt.destroyCrop          0x1B19DA0 (this, bool showAnimation)
+     *   FruitTree.isActionable       0x1B09970
+     *   Bush.isActionable            0x1B00360
+     *   Bush.getBoundingBox          0x1B00590
+     *   GameLocation.checkAction     0x1501600
+     *       (this, Location, Rectangle, Farmer) -- Location and Rectangle are
+     *       value structs: x1 = Location, x2/x3 = the two halves of Rectangle,
+     *       x4 = Farmer.  Verified at a real call site (0x1633908..0x163391C).
+     *   Game1.viewport               0xC95BBC0 (static, {x,y,w,h} ints)
+     *   Game1.tileSize               0x98B46CC (static int, 64)
+     *   GameLocation.largeTerrainFeatures +0x130 NetCollection<LargeTerrainFeature>
+     *       (inner List<T> at +0x58 -- ReadListRaw already knows that layout)
+     *
+     * Every class test below compares the vtable slot against a method body,
+     * never a guessed field: a wrong slot simply never matches, so a tile we
+     * do not understand is left alone instead of being mangled. */
+
+    constexpr unsigned kTfUseActionSlotOff = SDV_OFF(kTfUseActionSlotOff, 0x110u);
+    constexpr unsigned kCropForageOff      = SDV_OFF(kCropForageOff, 0x88u);
+    constexpr unsigned kTreeTappedOff      = SDV_OFF(kTreeTappedOff, 0x70u);
+    constexpr unsigned kTreeHasSeedOff     = SDV_OFF(kTreeHasSeedOff, 0x78u);
+    constexpr unsigned kTreeHasMossOff     = SDV_OFF(kTreeHasMossOff, 0x80u);
+    constexpr unsigned kObjSpawnedOff      = SDV_OFF(kObjSpawnedOff, 0xC8u);
+    constexpr unsigned kIndoorPotDirtOff   = SDV_OFF(kIndoorPotDirtOff, 0x218u);
+    constexpr unsigned kLargeTerrainOff    = SDV_OFF(kLargeTerrainOff, 0x130u);
+    constexpr unsigned kTfTileSlotOff      = SDV_OFF(kTfTileSlotOff, 0x60u);
+
+    constexpr uintptr_t kHoeDirtUseBodyOff   = SDV_OFF(kHoeDirtUseBodyOff, 0x1B19820u);
+    constexpr uintptr_t kTreeUseBodyOff      = SDV_OFF(kTreeUseBodyOff, 0x1B25EB0u);
+    constexpr uintptr_t kFruitTreeUseBodyOff = SDV_OFF(kFruitTreeUseBodyOff, 0x1B09B60u);
+    constexpr uintptr_t kBushUseBodyOff      = SDV_OFF(kBushUseBodyOff, 0x1B00790u);
+    constexpr uintptr_t kCropHarvestOff      = SDV_OFF(kCropHarvestOff, 0x1264D30u);
+    constexpr uintptr_t kCropHoeOff          = SDV_OFF(kCropHoeOff, 0x1264830u);
+    constexpr uintptr_t kHoeDirtDestroyOff   = SDV_OFF(kHoeDirtDestroyOff, 0x1B19DA0u);
+    constexpr uintptr_t kFruitTreeActionableOff =
+        SDV_OFF(kFruitTreeActionableOff, 0x1B09970u);
+    constexpr uintptr_t kBushActionableOff =
+        SDV_OFF(kBushActionableOff, 0x1B00360u);
+    constexpr uintptr_t kBushBoxOff        = SDV_OFF(kBushBoxOff, 0x1B00590u);
+    constexpr uintptr_t kCheckActionOff    = SDV_OFF(kCheckActionOff, 0x1501600u);
+    constexpr uintptr_t kGame1ViewportOff  = SDV_OFF(kGame1ViewportOff, 0xC95BBC0u);
+    constexpr uintptr_t kTileSizeOff       = SDV_OFF(kTileSizeOff, 0x98B46CCu);
+    /* Farmer.forceCanMove / completelyStopAnimatingOrDoingAction -- the pair
+     * the PC mod uses to undo the stoop animation Crop.harvest starts. */
+    constexpr uintptr_t kFarmerForceMoveOff = SDV_OFF(kFarmerForceMoveOff, 0x13DB1E0u);
+    constexpr uintptr_t kFarmerStopAnimOff  = SDV_OFF(kFarmerStopAnimOff, 0x13BF510u);
+    constexpr unsigned kFarmerSpriteAnimOff = SDV_OFF(kFarmerSpriteAnimOff, 0xA8u);
+    /* v483: clump diagnostics and the swing ticker.
+     *
+     * ResourceClump.performToolAction starts with
+     *     if (t == null || lastToolHitTicker == t.swingTicker) return false;
+     *     lastToolHitTicker = t.swingTicker;
+     * i.e. ONE hit per tool "swing", and the game advances swingTicker itself
+     * once per real swing.  Our nine DoFunction calls all used the same ticker,
+     * so the first clump hit of the whole session was also the last one -- the
+     * stump or log took one hit and then refused every later hit.  Vanilla's
+     * Player.useTool never has to think about it; the PC mod bumps it by hand
+     * (`tool.swingTicker++` in UseToolOnTile).  We do the same, per tile. */
+    constexpr unsigned kToolSwingTickerOff = SDV_OFF(kToolSwingTickerOff, 0xD0u);
+    constexpr unsigned kResourceClumpsOff  = SDV_OFF(kResourceClumpsOff, 0x128u);
+    constexpr unsigned kClumpIndexOff      = SDV_OFF(kClumpIndexOff, 0x40u);
+    constexpr unsigned kClumpHealthOff     = SDV_OFF(kClumpHealthOff, 0x50u);
+    constexpr unsigned kTfBoxSlotOff       = SDV_OFF(kTfBoxSlotOff, 0xB0u);
+
+    struct Rect4i { int x, y, w, h; };
+
+    /* Value of a NetRef field (the referenced object, or nullptr). */
+    void* NetRefVal(void* owner, unsigned off) {
+        if (owner == nullptr || !Plausible(owner)) {
+            return nullptr;
+        }
+        if (!RangeReadable(static_cast<char*>(owner) + off, sizeof(void*))) {
+            return nullptr;
+        }
+        void* ref = *reinterpret_cast<void**>(static_cast<char*>(owner) + off);
+        if (ref == nullptr || !Plausible(ref)) {
+            return nullptr;
+        }
+        if (!RangeReadable(static_cast<char*>(ref) + kNetValueOff2,
+                           sizeof(void*))) {
+            return nullptr;
+        }
+        void* v = *reinterpret_cast<void**>(static_cast<char*>(ref) + kNetValueOff2);
+        return (v != nullptr && Plausible(v)) ? v : nullptr;
+    }
+
+    /* One vtable entry of an object, or nullptr when the header is not
+     * readable.  Used both as a type test (compare against a known body) and
+     * as a direct call target for a method we already identified. */
+    void* VSlot(void* obj, unsigned off) {
+        if (obj == nullptr || !Plausible(obj)) {
+            return nullptr;
+        }
+        void* mt = *reinterpret_cast<void**>(obj);
+        if (mt == nullptr || !Plausible(mt)) {
+            return nullptr;
+        }
+        void* vt = *reinterpret_cast<void**>(static_cast<char*>(mt) + 8);
+        if (vt == nullptr || !Plausible(vt)) {
+            return nullptr;
+        }
+        return *reinterpret_cast<void**>(static_cast<char*>(vt) + off);
+    }
+
+    /* v484: does this pointer look like a Crop?  Used as a structural second
+     * chance when the vtable slot test does not match, so crop harvesting never
+     * depends on one slot offset being right.  A Crop's currentPhase (NetInt
+     * +0x30), dayOfCurrentPhase (NetInt +0x40) and phaseDays (NetList +0x18)
+     * all have to be readable and sane. */
+    bool LooksLikeCrop(void* crop) {
+        if (crop == nullptr || !Plausible(crop)) {
+            return false;
+        }
+        int phase = 0;
+        int day = 0;
+        if (!NetIntAt(crop, kCropCurrentPhaseOff, &phase) || phase < 0 ||
+            phase > 60) {
+            return false;
+        }
+        if (!NetIntAt(crop, kCropDayOfPhaseOff, &day) || day < 0 ||
+            day > 100000) {
+            return false;
+        }
+        return RangeReadable(static_cast<char*>(crop) + kCropPhaseDaysOff, 8u);
+    }
+
+    /* Undo the stoop Crop.harvest / checkAction start.  PC's mod does the same
+     * (CancelAnimation + forceCanMove) so the farmer does not stay stuck in
+     * the harvest frame while the tractor keeps moving. */
+    void ReleaseHarvestAnimation(void* pl) {
+        if (pl == nullptr || !Plausible(pl)) {
+            return;
+        }
+        void* sprite = NetRefVal(pl, kCharSpriteRefOff);
+        if (sprite != nullptr &&
+            RangeReadable(static_cast<char*>(sprite) + kFarmerSpriteAnimOff, 4u)) {
+            const int anim = *reinterpret_cast<const int*>(
+                static_cast<char*>(sprite) + kFarmerSpriteAnimOff);
+            if (anim >= 279 && anim <= 282) {
+                reinterpret_cast<void (*)(void*)>(
+                    g_base + kFarmerStopAnimOff)(pl);
+            }
+        }
+        reinterpret_cast<void (*)(void*)>(g_base + kFarmerForceMoveOff)(pl);
+    }
+
+    /* One "swing" per tile: ResourceClump only takes one hit per ticker value,
+     * and reusing the same value keeps it refusing forever. */
+    void BumpSwing(void* tool) {
+        if (tool == nullptr || !Plausible(tool)) {
+            return;
+        }
+        if (!RangeReadable(static_cast<char*>(tool) + kToolSwingTickerOff, 4u)) {
+            return;
+        }
+        int* ticker = reinterpret_cast<int*>(
+            static_cast<char*>(tool) + kToolSwingTickerOff);
+        if (*ticker < 0x40000000) {
+            ++*ticker;
+        }
+    }
+
+    /* v483 diagnostic: which resource clumps sit under the tractor and how much
+     * health they have left.  Logged only for the first few swings, so a test
+     * that still refuses to chop a log says why (wrong index, health not
+     * falling, upgrade level too low). */
+    void LogClumps(void* here, void* tool, int tx, int ty) {
+        if (s_v483Clump >= 6u || here == nullptr || !Plausible(here)) {
+            return;
+        }
+        if (!RangeReadable(static_cast<char*>(here) + kResourceClumpsOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* nc = *reinterpret_cast<void**>(
+            static_cast<char*>(here) + kResourceClumpsOff);
+        if (nc == nullptr || !Plausible(nc) ||
+            !RangeReadable(static_cast<char*>(nc) + kNetDictInnerOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* list = *reinterpret_cast<void**>(
+            static_cast<char*>(nc) + kNetDictInnerOff);
+        void** items = nullptr;
+        int count = 0;
+        if (!ReadListRaw(list, &items, &count)) {
+            return;
+        }
+        int level = -1;
+        if (RangeReadable(static_cast<char*>(tool) + 0xE0, sizeof(void*))) {
+            void* lv = *reinterpret_cast<void**>(static_cast<char*>(tool) + 0xE0);
+            if (lv != nullptr && Plausible(lv) &&
+                RangeReadable(static_cast<char*>(lv) + kNetValueOff2, 4u)) {
+                level = *reinterpret_cast<int*>(static_cast<char*>(lv) + kNetValueOff2);
+            }
+        }
+        for (int i = 0; i < count && i < 64 && s_v483Clump < 6u; i++) {
+            void* c = items[i];
+            if (c == nullptr || !Plausible(c)) {
+                continue;
+            }
+            void* boxFn = VSlot(c, kTfBoxSlotOff);
+            if (boxFn == nullptr) {
+                continue;
+            }
+            const Rect4i r = reinterpret_cast<Rect4i (*)(void*)>(boxFn)(c);
+            bool inside = false;
+            for (int dy = -kTractorRadius; dy <= kTractorRadius && !inside; ++dy) {
+                for (int dx = -kTractorRadius; dx <= kTractorRadius && !inside; ++dx) {
+                    const int px = (tx + dx) * 64;
+                    const int py = (ty + dy) * 64;
+                    inside = r.x < px + 64 && px < r.x + r.w &&
+                             r.y < py + 64 && py < r.y + r.h;
+                }
+            }
+            if (!inside) {
+                continue;
+            }
+            int idx = -1;
+            float hp = -1.0f;
+            if (RangeReadable(static_cast<char*>(c) + kClumpIndexOff, sizeof(void*))) {
+                void* ir = *reinterpret_cast<void**>(static_cast<char*>(c) + kClumpIndexOff);
+                if (ir != nullptr && Plausible(ir) &&
+                    RangeReadable(static_cast<char*>(ir) + kNetValueOff2, 4u)) {
+                    idx = *reinterpret_cast<int*>(static_cast<char*>(ir) + kNetValueOff2);
+                }
+            }
+            if (RangeReadable(static_cast<char*>(c) + kClumpHealthOff, sizeof(void*))) {
+                void* hr = *reinterpret_cast<void**>(static_cast<char*>(c) + kClumpHealthOff);
+                if (hr != nullptr && Plausible(hr) &&
+                    RangeReadable(static_cast<char*>(hr) + kNetValueOff2, 4u)) {
+                    hp = *reinterpret_cast<float*>(static_cast<char*>(hr) + kNetValueOff2);
+                }
+            }
+            ++s_v483Clump;
+            LOGF("v483 clump idx=%d hp=%d.%d axeLvl=%d t=%d,%d", idx,
+                 static_cast<int>(hp), static_cast<int>(hp * 10) % 10, level, tx, ty);
+        }
+    }
+
+    /* Harvest (or clear) the crop on one HoeDirt.  `here` is only needed for
+     * the ginger / spring-onion fallback, which hands the tile to the game. */
+    bool ScytheCrop(void* here, void* dirt, int tx, int ty) {
+        if (dirt == nullptr || !Plausible(dirt)) {
+            return false;
+        }
+        void* crop = NetRefVal(dirt, kHoeDirtNetCropOff);
+        if (s_v484Crop < 8u) {
+            ++s_v484Crop;
+            LOGF("v484 cropcall t=%d,%d crop=%d", tx, ty, crop != nullptr ? 1 : 0);
+        }
+        if (crop == nullptr) {
+            return false;
+        }
+        auto destroyCrop = reinterpret_cast<void (*)(void*, int)>(
+            g_base + kHoeDirtDestroyOff);
+        bool dead = false;
+        if (NetBoolAt(crop, kCropDeadOff, &dead) && dead) {
+            /* dead plant: clearing it is the whole job */
+            destroyCrop(dirt, 0);
+            return true;
+        }
+        auto harvest = reinterpret_cast<bool (*)(void*, int, int, void*, void*, int)>(
+            g_base + kCropHarvestOff);
+        int dayBefore = 0;
+        bool haveDay = NetIntAt(crop, kCropDayOfPhaseOff, &dayBefore);
+        /* v483: isForcedScytheHarvest = true.
+         *
+         * With false (v482) Crop.harvest takes the hand-pick branch:
+         * addItemToInventory + animateOnce(279+dir) + Game1.player.canMove =
+         * false.  The lock is what made harvesting feel sluggish, and the
+         * animation plays while the tractor is already two tiles away.  With
+         * true it takes the scythe branch instead -- the item pops out as
+         * debris (which the player picks up by driving over it) and no
+         * animation or canMove lock happens at all.  Quality, experience and
+         * the regrow reset are identical in both branches. */
+        if (harvest(crop, tx, ty, dirt, nullptr, 1)) {
+            destroyCrop(dirt, 1);
+            if (s_v482Crop < 4u) {
+                ++s_v482Crop;
+                LOGF("v482 crop harvest t=%d,%d", tx, ty);
+            }
+            return true;
+        }
+        /* A regrowing crop (strawberry, blueberry, ...) is harvested for real
+         * and then returns false on purpose: Crop.harvest resets
+         * dayOfCurrentPhase to the regrow delay and keeps the plant.  The
+         * phase moving is the proof that items were collected, and reporting
+         * it keeps the old "nothing happened" fallback from swinging the
+         * scythe by hand on every step across a harvested field. */
+        if (haveDay) {
+            int dayAfter = 0;
+            if (NetIntAt(crop, kCropDayOfPhaseOff, &dayAfter) &&
+                dayAfter != dayBefore) {
+                if (s_v482Crop < 4u) {
+                    ++s_v482Crop;
+                    LOGF("v482 crop regrow t=%d,%d", tx, ty);
+                }
+                return true;
+            }
+        }
+        /* forage crops (ginger, spring onion) are dug out, not picked */
+        bool forage = false;
+        if (NetBoolAt(crop, kCropForageOff, &forage) && forage) {
+            auto hitWithHoe =
+                reinterpret_cast<bool (*)(void*, int, int, void*, void*)>(
+                    g_base + kCropHoeOff);
+            if (hitWithHoe(crop, tx, ty, here, dirt)) {
+                destroyCrop(dirt, 0);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* Tree seeds and moss. */
+    bool ScytheTree(void* here, void* tool, void* tf, int tx, int ty) {
+        const Vec2 key{static_cast<float>(tx), static_cast<float>(ty)};
+        bool hasSeed = false;
+        bool tapped = false;
+        bool hasMoss = false;
+        (void)NetBoolAt(tf, kTreeHasSeedOff, &hasSeed);
+        (void)NetBoolAt(tf, kTreeTappedOff, &tapped);
+        (void)NetBoolAt(tf, kTreeHasMossOff, &hasMoss);
+        if (hasSeed && !tapped) {
+            auto use = reinterpret_cast<bool (*)(void*, Vec2)>(
+                g_base + kTreeUseBodyOff);
+            if (use(tf, key)) {
+                if (s_v482Tree < 4u) {
+                    ++s_v482Tree;
+                    LOGF("v482 tree seed t=%d,%d", tx, ty);
+                }
+                return true;
+            }
+        }
+        if (hasMoss) {
+            void* fn = VSlot(tf, kTfToolActionSlotOff);
+            if (fn != nullptr) {
+                auto cut = reinterpret_cast<bool (*)(void*, void*, int, Vec2, void*)>(fn);
+                if (cut(tf, tool, 0, key, here)) {
+                    if (s_v482Tree < 4u) {
+                        ++s_v482Tree;
+                        LOGF("v482 tree moss t=%d,%d", tx, ty);
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /* Fruit hanging on a fruit tree (also covers palm trees). */
+    bool ScytheFruitTree(void* tf, int tx, int ty) {
+        if (reinterpret_cast<int (*)(void*)>(g_base + kFruitTreeActionableOff)(tf) == 0) {
+            return false;
+        }
+        const Vec2 key{static_cast<float>(tx), static_cast<float>(ty)};
+        return reinterpret_cast<bool (*)(void*, Vec2)>(
+            g_base + kFruitTreeUseBodyOff)(tf, key);
+    }
+
+    /* Anything the player would pick up with the action button: spawned
+     * forage on the ground, and mine drops after a rock is broken. */
+    void PickUpSpawned(void* here, void* pl, int tx, int ty) {
+        if (here == nullptr || !Plausible(here) || pl == nullptr) {
+            return;
+        }
+        if (!RangeReadable(reinterpret_cast<void*>(g_base + kGame1ViewportOff), 16u)) {
+            return;
+        }
+        const int* vp = reinterpret_cast<const int*>(g_base + kGame1ViewportOff);
+        const unsigned long long loc =
+            static_cast<unsigned>(tx) |
+            (static_cast<unsigned long long>(static_cast<unsigned>(ty)) << 32);
+        const unsigned long long xy =
+            static_cast<unsigned>(vp[0]) |
+            (static_cast<unsigned long long>(static_cast<unsigned>(vp[1])) << 32);
+        const unsigned long long wh =
+            static_cast<unsigned>(vp[2]) |
+            (static_cast<unsigned long long>(static_cast<unsigned>(vp[3])) << 32);
+        auto checkAction =
+            reinterpret_cast<int (*)(void*, unsigned long long,
+                                     unsigned long long, unsigned long long, void*)>(
+                g_base + kCheckActionOff);
+        /* v485: THE RIDING GATE.
+         *
+         * GameLocation.checkAction starts its object branch with
+         *
+         *     if (who.isRidingHorse() && !(obj is Fence)) return false;
+         *
+         * so while the player sits on the tractor nothing is ever picked up --
+         * the call returns immediately and no item moves.  The only reason the
+         * player could still grab a forage item "in front of them" was the old
+         * fallback, which hides the mount and presses the real use button; that
+         * is why it only worked on the tile the farmer faced.
+         *
+         * Clear the mount reference for the duration of the call (the same
+         * trick the fallback uses) and put it back afterwards.  Only the mount
+         * NetRef changes; the horse's own rider link is untouched. */
+        void* mountRef = *reinterpret_cast<void**>(
+            static_cast<char*>(pl) + kFarmerNetMountOff);
+        void** mountSlot = nullptr;
+        void* horse = nullptr;
+        if (mountRef != nullptr && Plausible(mountRef)) {
+            mountSlot = reinterpret_cast<void**>(
+                static_cast<char*>(mountRef) + kNetValueOff2);
+            horse = *mountSlot;
+        }
+        if (mountSlot != nullptr && horse != nullptr) {
+            *mountSlot = nullptr;
+        }
+        const int got = checkAction(here, loc, xy, wh, pl);
+        if (mountSlot != nullptr) {
+            *mountSlot = horse;
+        }
+        if (got != 0) {
+            ReleaseHarvestAnimation(pl);
+            if (s_v482Pickup < 4u) {
+                ++s_v482Pickup;
+                LOGF("v482 pickup t=%d,%d", tx, ty);
+            }
+        }
+    }
+
+    /* Is this Object one of the weed sprites? */
+    bool IsWeedsOf(void* obj) {
+        if (obj == nullptr || !Plausible(obj)) {
+            return false;
+        }
+        return reinterpret_cast<bool (*)(void*)>(
+                   g_base + kObjectIsWeedsOff)(obj) != 0;
+    }
+
+    /* The Object sitting on one tile, or nullptr.  Objects live in their own
+     * NetDictionary whose inner map is at +0x20, so the lookup goes through
+     * the same thunk the weeds route uses. */
+    void* ObjAt(void* here, int tx, int ty) {
+        if (here == nullptr || !Plausible(here)) {
+            return nullptr;
+        }
+        if (!RangeReadable(static_cast<char*>(here) + kObjectsOff, sizeof(void*))) {
+            return nullptr;
+        }
+        void* odict = *reinterpret_cast<void**>(static_cast<char*>(here) + kObjectsOff);
+        if (odict == nullptr || !Plausible(odict)) {
+            return nullptr;
+        }
+        const Vec2 key{static_cast<float>(tx), static_cast<float>(ty)};
+        void* obj = nullptr;
+        if (!reinterpret_cast<bool (*)(void*, Vec2, void**)>(
+                g_base + kObjectsTryGetOff)(odict, key, &obj)) {
+            return nullptr;
+        }
+        return (obj != nullptr && Plausible(obj)) ? obj : nullptr;
+    }
+
+    /* Tea bushes and berry bushes live in largeTerrainFeatures, not in
+     * terrainFeatures, so they need their own pass.  The list is read with
+     * ReadListRaw (the same List<T> reader the map uses) and each element is
+     * accepted only when its performUseAction slot is Bush's body. */
+    bool ScytheBushes(void* here, int tx, int ty) {
+        if (here == nullptr || !Plausible(here)) {
+            return false;
+        }
+        if (!RangeReadable(static_cast<char*>(here) + kLargeTerrainOff,
+                           sizeof(void*))) {
+            return false;
+        }
+        void* nc = *reinterpret_cast<void**>(static_cast<char*>(here) + kLargeTerrainOff);
+        if (nc == nullptr || !Plausible(nc)) {
+            return false;
+        }
+        if (!RangeReadable(static_cast<char*>(nc) + kNetDictInnerOff,
+                           sizeof(void*))) {
+            return false;
+        }
+        void* list = *reinterpret_cast<void**>(static_cast<char*>(nc) + kNetDictInnerOff);
+        void** items = nullptr;
+        int count = 0;
+        if (!ReadListRaw(list, &items, &count)) {
+            return false;
+        }
+        int tileSize = 64;
+        if (RangeReadable(reinterpret_cast<void*>(g_base + kTileSizeOff), 4u)) {
+            const int ts = *reinterpret_cast<const int*>(g_base + kTileSizeOff);
+            if (ts >= 16 && ts <= 256) {
+                tileSize = ts;
+            }
+        }
+        void* bushBody = reinterpret_cast<void*>(g_base + kBushUseBodyOff);
+        bool did = false;
+        for (int i = 0; i < count && i < 4096; i++) {
+            void* b = items[i];
+            if (b == nullptr || !Plausible(b)) {
+                continue;
+            }
+            if (VSlot(b, kTfUseActionSlotOff) != bushBody) {
+                continue;
+            }
+            /* a bush is two tiles wide, so test its box against the area */
+            const Rect4i r = reinterpret_cast<Rect4i (*)(void*)>(
+                g_base + kBushBoxOff)(b);
+            bool inside = false;
+            for (int dy = -kTractorRadius; dy <= kTractorRadius && !inside; ++dy) {
+                for (int dx = -kTractorRadius; dx <= kTractorRadius && !inside; ++dx) {
+                    const int px = (tx + dx) * tileSize;
+                    const int py = (ty + dy) * tileSize;
+                    inside = r.x < px + tileSize && px < r.x + r.w &&
+                             r.y < py + tileSize && py < r.y + r.h;
+                }
+            }
+            if (!inside) {
+                continue;
+            }
+            if (reinterpret_cast<int (*)(void*)>(g_base + kBushActionableOff)(b) == 0) {
+                continue;         /* nothing ripe */
+            }
+            void* getTile = VSlot(b, kTfTileSlotOff);
+            if (getTile == nullptr) {
+                continue;
+            }
+            const Vec2 tile = reinterpret_cast<Vec2 (*)(void*)>(getTile)(b);
+            reinterpret_cast<bool (*)(void*, Vec2)>(
+                g_base + kBushUseBodyOff)(b, tile);
+            if (s_v482Bush < 4u) {
+                ++s_v482Bush;
+                LOGF("v482 bush harvest t=%d,%d", static_cast<int>(tile.x),
+                     static_cast<int>(tile.y));
+            }
+            did = true;
+        }
+        return did;
+    }
+
+    /* Is this object a garden pot with a HoeDirt inside?  The pot is an
+     * IndoorPot (Object +0x218), and the dirt is only accepted when its
+     * performUseAction slot really is HoeDirt's. */
+    void* PotDirt(void* obj) {
+        void* dirt = NetRefVal(obj, kIndoorPotDirtOff);
+        if (dirt == nullptr) {
+            return nullptr;
+        }
+        if (VSlot(dirt, kTfUseActionSlotOff) !=
+            reinterpret_cast<void*>(g_base + kHoeDirtUseBodyOff)) {
+            return nullptr;
+        }
+        return dirt;
+    }
+
     void AutoTractorUse() {
         auto mark = [](unsigned n) {
             if (s_scytheStage < n) {
@@ -17750,6 +18352,25 @@ namespace {
                                 continue;
                             }
                             mark(0x11);
+                            /* v482: spawned forage and mine drops are picked
+                             * up through the player action path, exactly like
+                             * a hand press (checkAction), then left alone. */
+                            bool spawned = false;
+                            (void)NetBoolAt(obj, kObjSpawnedOff, &spawned);
+                            if (spawned) {
+                                PickUpSpawned(here, pl, tx + dx, ty + dy);
+                                continue;
+                            }
+                            /* v482: a garden pot standing on this tile holds a
+                             * HoeDirt of its own; harvest it like field soil. */
+                            {
+                                void* potDirt = PotDirt(obj);
+                                if (potDirt != nullptr &&
+                                    ScytheCrop(here, potDirt, tx + dx, ty + dy)) {
+                                    applied++;
+                                    continue;
+                                }
+                            }
                             if (!isWeeds(obj)) {
                                 continue;      /* not a weed: leave it alone */
                             }
@@ -17863,6 +18484,78 @@ namespace {
                             continue;
                         }
                         mark(14);
+                        /* v484: what this tile actually is.  `du` is the
+                         * distance between the performUseAction slot and the
+                         * HoeDirt body we expect (0 = exact match), `dg` the
+                         * same for Grass/performToolAction, `crop` says whether
+                         * the tile holds a readable Crop.  First 12 features
+                         * only. */
+                        if (s_v484Seen < 12u) {
+                            ++s_v484Seen;
+                            void* u110 = VSlot(tf, kTfUseActionSlotOff);
+                            void* u120 = VSlot(tf, kTfToolActionSlotOff);
+                            LOGF("v484 tf t=%d,%d du=%d dg=%d crop=%d",
+                                 tx + dx, ty + dy,
+                                 static_cast<int>(
+                                     reinterpret_cast<uintptr_t>(u110) -
+                                     reinterpret_cast<uintptr_t>(
+                                         g_base + kHoeDirtUseBodyOff)),
+                                 static_cast<int>(
+                                     reinterpret_cast<uintptr_t>(u120) -
+                                     reinterpret_cast<uintptr_t>(
+                                         g_base + kGrassPTAOff)),
+                                 NetRefVal(tf, kHoeDirtNetCropOff) != nullptr ? 1 : 0);
+                        }
+                        /* v482: crops, fruit trees and trees each answer to
+                         * their own performUseAction body; only Grass falls
+                         * through to the cutting route below. */
+                        {
+                            void* use = VSlot(tf, kTfUseActionSlotOff);
+                            bool isDirt =
+                                use == reinterpret_cast<void*>(
+                                           g_base + kHoeDirtUseBodyOff) ||
+                                LooksLikeCrop(NetRefVal(tf, kHoeDirtNetCropOff));
+                            if (isDirt) {
+                                bool did = ScytheCrop(here, tf, tx + dx, ty + dy);
+                                if (!did) {
+                                    /* Crops whose HarvestMethod is Scythe
+                                     * (wheat, amaranth, kale, ...) are not
+                                     * harvested by Crop.harvest at all: vanilla
+                                     * only cuts them in HoeDirt.performToolAction
+                                     * with a scythe in hand.  Use the same slot
+                                     * the grass route uses, so the tool's own
+                                     * ItemId decides (0x66 = iridium scythe). */
+                                    void* fn = VSlot(tf, kTfToolActionSlotOff);
+                                    if (fn != nullptr) {
+                                        const Vec2 tk{static_cast<float>(tx + dx),
+                                                      static_cast<float>(ty + dy)};
+                                        did = reinterpret_cast<bool (*)(
+                                            void*, void*, int, Vec2, void*)>(fn)(
+                                            tf, tool, 0, tk, here);
+                                    }
+                                }
+                                if (did) {
+                                    applied++;
+                                    ReleaseHarvestAnimation(pl);
+                                }
+                                continue;
+                            }
+                            if (use == reinterpret_cast<void*>(
+                                            g_base + kTreeUseBodyOff)) {
+                                if (ScytheTree(here, tool, tf,
+                                               tx + dx, ty + dy)) {
+                                    applied++;
+                                }
+                                continue;
+                            }
+                            if (use == reinterpret_cast<void*>(
+                                            g_base + kFruitTreeUseBodyOff)) {
+                                if (ScytheFruitTree(tf, tx + dx, ty + dy)) {
+                                    applied++;
+                                }
+                                continue;
+                            }
+                        }
                         if (s_grassFound < 255u) {
                             s_grassFound++;
                         }
@@ -18045,6 +18738,12 @@ namespace {
                     }
                 }
             }
+            /* v482: tea and berry bushes are LargeTerrainFeature, i.e. they
+             * live in largeTerrainFeatures and appear in neither dictionary
+             * above.  One pass per step, not per tile: the list is short. */
+            if (ScytheBushes(here, tx, ty)) {
+                applied++;
+            }
             if (applied == 0) {
                 /* v266 FALLBACK + DIAGNOSTIC.
                  *
@@ -18078,6 +18777,10 @@ namespace {
                         }
                         s_forceTractorPower = false;
                         *slot = horse;
+                        if (s_v484Fb < 6u) {
+                            ++s_v484Fb;
+                            LOGF("v484 fallback t=%d,%d", tx, ty);
+                        }
                     }
                 }
             }
@@ -18092,15 +18795,107 @@ namespace {
                 auto setStamina = reinterpret_cast<void (*)(void*, float)>(
                     g_base + kSetStaminaOff);
                 const float staminaBefore = getStamina(pl);
+                /* v481: RESOURCE CLUMPS (big stumps, big logs, boulders).
+                 *
+                 * Axe.DoFunction only walks terrainFeatures: it resolves the
+                 * tile, looks the tile up there, and hands it a
+                 * performToolAction.  It never looks at the location's
+                 * resourceClumps list, so the 2x2 hardwood stump / log /
+                 * boulder that lives in THAT list takes no damage at all --
+                 * which is exactly "the tractor cannot chop the hardwood
+                 * stump" while trees fall over just fine.
+                 *
+                 * A vanilla swing clears them through a second entry point:
+                 * Farmer.useTool ends up in GameLocation.performToolAction
+                 * (0x1535930), which iterates resourceClumps and calls
+                 * clump.performToolAction with its own damage figure.  The
+                 * tractor path never called it, so that whole category was
+                 * invisible to the axe and the pickaxe.
+                 *
+                 * Only the axe and the pickaxe get this pass: the hoe and the
+                 * watering can already build their own area, and running an
+                 * arbitrary tool through performToolAction on nine tiles is
+                 * how you water or till things nobody asked for.  Tool.lastUser
+                 * is set first because the clump hands the tool back to
+                 * getLastFarmerToUse() for professions and drops. */
+                const bool clumpTool =
+                    toolRow == kRowAxe || toolRow == kRowPick;
+                /* v483: clumps are NOT reached from DoFunction in this build.
+                 * Axe.DoFunction only does objects, terrainFeatures and
+                 * largeTerrainFeatures (it calls GameLocation.get_Objects but
+                 * never performToolAction), and Tool.DoFunction is the swing.
+                 * A vanilla swing finds clumps because Farmer.useTool calls
+                 * GameLocation.performToolAction afterwards -- that is the only
+                 * place resourceClumps is iterated.  So the tractor has to make
+                 * that second call itself (v481 did; v483 makes it actually
+                 * take effect by moving the swing ticker). */
+                auto performTile =
+                    reinterpret_cast<bool (*)(void*, void*, int, int, void*)>(
+                        g_base + kPerformToolActionOff);
+                if (clumpTool) {
+                    /* Clump.destroy hands the tool back to getLastFarmerToUse()
+                     * for stats and experience. */
+                    *reinterpret_cast<void**>(
+                        static_cast<char*>(tool) + kToolLastUserOff) = pl;
+                    LogClumps(here, tool, tx, ty);
+                }
                 bool first = true;
                 for (int dy = -kTractorRadius; dy <= kTractorRadius; ++dy) {
                     for (int dx = -kTractorRadius; dx <= kTractorRadius; ++dx) {
+                        /* v482: mine drops are Objects with IsSpawnedObject --
+                         * a pickaxe swing does not pick those up, the action
+                         * button does.  Take them before the swing, so the
+                         * pickaxe cannot smash what it should collect. */
+                        if (toolRow == kRowPick) {
+                            void* drop = ObjAt(here, tx + dx, ty + dy);
+                            bool dropSpawned = false;
+                            if (drop != nullptr &&
+                                NetBoolAt(drop, kObjSpawnedOff, &dropSpawned) &&
+                                dropSpawned) {
+                                PickUpSpawned(here, pl, tx + dx, ty + dy);
+                            }
+                        }
                         /* silence every call after the first, like the PC mod */
                         if (!first) {
                             *sounds = 0;
                         }
+                        /* v483: one swing per tile.  DoFunction already applies
+                         * the tool to the tile's clump itself (Axe.DoFunction
+                         * calls GameLocation.performToolAction), but the clump
+                         * refuses a second hit at the same ticker value, and
+                         * the ticker only moves when the game swings. */
+                        BumpSwing(tool);
                         callTool(tool, here, (tx + dx) * 64 + 32,
                                  (ty + dy) * 64 + 32, 1, pl);
+                        if (clumpTool) {
+                            performTile(here, tool, tx + dx, ty + dy, pl);
+                        }
+                        /* v483: weeds and twigs by hand.  DoFunction's object
+                         * pass has an `obj.Type != null` gate; this is the same
+                         * clear the scythe route does, so an axe or a pickaxe
+                         * never leaves a weed standing. */
+                        if (clumpTool) {
+                            void* obj = ObjAt(here, tx + dx, ty + dy);
+                            if (obj != nullptr && IsWeedsOf(obj)) {
+                                void* fn = FindVTableSlot(
+                                    obj, reinterpret_cast<void*>(
+                                             g_base + kObjectPTAOff));
+                                if (fn != nullptr &&
+                                    reinterpret_cast<bool (*)(void*, void*)>(fn)(
+                                        obj, tool)) {
+                                    void* odict = *reinterpret_cast<void**>(
+                                        static_cast<char*>(here) + kObjectsOff);
+                                    if (odict != nullptr && Plausible(odict)) {
+                                        const Vec2 key{
+                                            static_cast<float>(tx + dx),
+                                            static_cast<float>(ty + dy)};
+                                        reinterpret_cast<bool (*)(void*, Vec2)>(
+                                            g_base + kObjectsRemoveOff)(
+                                            odict, key);
+                                    }
+                                }
+                            }
+                        }
                         first = false;
                     }
                 }
