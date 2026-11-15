@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 507;
+    constexpr int kBuildNo = 517;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -2312,6 +2312,8 @@ namespace {
     /* v489: how many products went into a chest that already held that item
      * (the output-priority rule).  Saturates at 0xF. */
     static unsigned s_autoPrio = 0;
+    /* v510: bush reset failures (capped log). */
+    static unsigned s_bushResetFail = 0;
     /* v343: file-store open attempts, drawn on the readout (rows 16/17). */
     static unsigned s_logTry = 0;
     static unsigned s_logFrame = 0;
@@ -13684,6 +13686,14 @@ namespace {
      * open -- the player is very likely dragging items in a chest the cycle is
      * about to fill or drain, and game time does not advance in menus anyway. */
     constexpr uintptr_t kGame1MenuOff = SDV_OFF(kGame1MenuOff, 0xC95C140u);
+
+    /* v510: is a modal UI up right now? */
+    bool MenuOpen() {
+        if (!RangeReadable(reinterpret_cast<void*>(g_base + kGame1MenuOff), 8u)) {
+            return false;
+        }
+        return *reinterpret_cast<void**>(g_base + kGame1MenuOff) != nullptr;
+    }
     constexpr uintptr_t kDictTryGetOff      = SDV_OFF(kDictTryGetOff,      0x19A1710u);
     constexpr uintptr_t kChestAddItemOff    = SDV_OFF(kChestAddItemOff,    0x1A0D680u);
     constexpr uintptr_t kChestGetItemsOff   = SDV_OFF(kChestGetItemsOff,   0x1A0D350u);
@@ -15407,7 +15417,11 @@ namespace {
     }
 
     /* Defined below with the pond hook; RunAutomation is above it. */
+    void CollectGroupBushesNow();
     void CollectPonds();
+    void CollectBushes();
+    void CollectGroupBushes(void* dict, void* unwrapFn, void* ndBase,
+                            void* here, void* pl);
     void CollectHuts();
 
     /* v454: the item id of a managed Item, as an int.
@@ -15550,6 +15564,13 @@ namespace {
         if (pl == nullptr) {
             return;
         }
+        /* v510: berries/tea first -- no machine needed, so they work in a
+         * location with nothing else automated.  Never during an event or with
+         * a menu up. */
+        if (kAutomate && !MenuOpen() &&
+            *reinterpret_cast<const unsigned char*>(g_base + kEventUpOff) == 0) {
+            CollectBushes();
+        }
         /* v487: stand down while a menu is open.  The player is then most
          * likely moving items inside a chest this cycle would be filling or
          * draining, which is the one case where automation can eat an item
@@ -15584,7 +15605,9 @@ namespace {
             s_dbgGrpChests = static_cast<unsigned>(s_grpChestCount);
             s_dbgGrpMachines = static_cast<unsigned>(s_grpMachineCount);
             s_dbgGrpNodes = s_grpNodes;
-
+            /* v511: a bush standing next to a MACHINE of this group is part of
+             * the same chain -- harvest it into the group's chests. */
+            CollectGroupBushesNow();
             /* Output first, so a machine that finished this tick is emptied
              * before anything new is pushed into it. */
             for (int m = 0; kAutomateOutput && m < s_grpMachineCount; ++m) {
@@ -18233,6 +18256,56 @@ namespace {
         return did;
     }
 
+    /* v509: tea bush maturity.  Bush.getAge() is `Game1.stats.DaysPlayed -
+     * datePlanted` (no Location involved), and the maturity constant is the
+     * rodata int at 0x98B7828 (value 20) -- read at runtime with a sane-range
+     * guard so a moved offset can never print nonsense. */
+    constexpr uintptr_t kBushAgeOff      = SDV_OFF(kBushAgeOff,      0x1AFFAE0u);
+    constexpr uintptr_t kBushTeaDaysOff  = SDV_OFF(kBushTeaDaysOff,  0x98B7828u);
+
+    /* Fill s_cropDays / flags bit 0x200 with "days until a tea bush can
+     * produce".  Only for a tea bush (size 3) that is not producing yet. */
+    void BushCountdown(void* bush, int size, int sheet) {
+        if (size != 3 || sheet == 1 || bush == nullptr || !Plausible(bush)) {
+            return;
+        }
+        int mature = 20;
+        if (RangeReadable(reinterpret_cast<void*>(g_base + kBushTeaDaysOff), 4u)) {
+            const int raw = *reinterpret_cast<const int*>(g_base + kBushTeaDaysOff);
+            if (raw > 0 && raw < 120) {
+                mature = raw;
+            }
+        }
+        const int age = reinterpret_cast<int (*)(void*)>(g_base + kBushAgeOff)(bush);
+        const int need = mature - age;
+        if (need >= 1 && need <= 99) {
+            s_cropDays = need;
+            s_cropFlags |= 0x200u;      /* 还需 N 天 */
+            return;
+        }
+        /* Mature but not producing: a tea bush re-arms at the next day start,
+         * except in winter, where it does not produce at all. */
+        int season = -1;
+        if (RangeReadable(reinterpret_cast<void*>(g_base + kSeasonOff), 4u)) {
+            season = *reinterpret_cast<const int*>(g_base + kSeasonOff);
+        }
+        s_cropFlags |= (season == 3) ? 0x400u : 0x800u;
+    }
+
+    /* v510: berry / tea bush harvest.  Fixed addresses only:
+     * GetShakeOffItem(this) -> managed string, ItemRegistry.Create(id, count,
+     * quality, null) -> Item, Chest.addItem(chest, item),
+     * Farmer.addItemToInventoryBool(item, false), Bush.setUpSourceRect(this),
+     * Farmer.gainExperience(which, amount). */
+    constexpr uintptr_t kBushProduceOff   = SDV_OFF(kBushProduceOff,   0x1B011E0u);
+    constexpr uintptr_t kBushSetUpRectOff = SDV_OFF(kBushSetUpRectOff, 0x1AFFB10u);
+    constexpr uintptr_t kItemCreateOff    = SDV_OFF(kItemCreateOff,    0x15B98C0u);
+    constexpr uintptr_t kAddToInventoryOff =
+        SDV_OFF(kAddToInventoryOff, 0x13CD110u);
+    constexpr uintptr_t kGainXpOff        = SDV_OFF(kGainXpOff,        0x13C1BE0u);
+    constexpr uintptr_t kForagingLevelOff =
+        SDV_OFF(kForagingLevelOff, 0x13B8550u);
+
     /* v499: the tile in front is not tilled soil.  Report the three other
      * things that grow: a fruit tree (how many fruit), a berry/tea bush (ripe or
      * not) and a giant crop (ready to be chopped).  All of them fill the same
@@ -18288,6 +18361,7 @@ namespace {
                     s_cropFlags = 1u | (2u << 4) | ((sheet == 1 ? 1u : 0u) << 8);
                     s_cropCount = size;
                     s_cropName = (size == 3) ? g_bushNameTea : g_bushNameBerry;
+                    BushCountdown(b, size, sheet);
                     return true;
                 }
             }
@@ -18313,6 +18387,7 @@ namespace {
                 s_cropFlags = 1u | (2u << 4) | ((sheet == 1 ? 1u : 0u) << 8);
                 s_cropCount = size;
                 s_cropName = (size == 3) ? g_bushNameTea : g_bushNameBerry;
+                BushCountdown(feature, size, sheet);
                 return true;
             }
             if (VSlot(feature, kTfUseActionSlotOff) ==
@@ -18339,6 +18414,17 @@ namespace {
                 s_cropFlags = 1u | (1u << 4) | ((n > 0 ? 1u : 0u) << 8);
                 s_cropCount = n;
                 s_cropName = g_fruitTreeName;
+                /* v514: a young fruit tree counts down to maturity (the `n 天`
+                 * the game shows nowhere else).  Once mature, fruit appears on
+                 * a daily random roll, so there is no honest number to show. */
+                if (n == 0) {
+                    int mature = 0;
+                    if (NetIntAt(feature, 0x58u, &mature) && mature > 0 &&
+                        mature < 100) {
+                        s_cropDays = mature;
+                        s_cropFlags |= 0x200u;
+                    }
+                }
                 return true;
             }
         }
@@ -18379,6 +18465,435 @@ namespace {
             }
         }
         return false;
+    }
+
+    /* ---- v512: bush harvest with a real chain --------------------------
+     *
+     * The automation group is a flood over chests, machines and connectors.
+     * v511 anchored the bush scan on chests and machines, but a chain like
+     *
+     *     [chest] [tea] [tea] [tea]
+     *
+     * still only collected the bush next to the chest: the second bush touches
+     * only the first bush, which was not an anchor.
+     *
+     * So the scan now grows its own anchor set: every harvested bush adds its
+     * own tiles as anchors, which is how PC Automate chains automatables.  The
+     * seeds are either the registered chests (locations with no machines) or
+     * every tile of the current group's flood (chest + machine + connector
+     * tiles, s_markKeys), so a bush touching a path that reaches the chest is
+     * part of the chain too.
+     *
+     * Every candidate is gated on its own get_Location (slot 0x40) being the
+     * current location: a bush that has been deserialised but not yet attached
+     * would make GetShakeOffItem throw.
+     */
+    static int s_anchorX[96];
+    static int s_anchorY[96];
+    static int s_anchorN = 0;
+    static int s_bushHitX0 = 0;
+    static int s_bushHitY0 = 0;
+    static int s_bushHitW = 0;
+    static int s_bushHitH = 0;
+
+    void AddAnchor(int x, int y) {
+        if (s_anchorN >= 96) {
+            return;
+        }
+        if (x < 0 || y < 0 || x > 4096 || y > 4096) {
+            return;
+        }
+        for (int i = 0; i < s_anchorN; ++i) {
+            if (s_anchorX[i] == x && s_anchorY[i] == y) {
+                return;
+            }
+        }
+        s_anchorX[s_anchorN] = x;
+        s_anchorY[s_anchorN] = y;
+        ++s_anchorN;
+    }
+
+    bool HarvestBushAt(void* tf, int tx, int ty, void* pl, void* chest,
+                       int chestCount) {
+        auto getProduce = reinterpret_cast<void* (*)(void*)>(g_base + kBushProduceOff);
+        auto createItem = reinterpret_cast<void* (*)(void*, int, int, void*)>(
+            g_base + kItemCreateOff);
+        auto setUpRect = reinterpret_cast<void (*)(void*)>(g_base + kBushSetUpRectOff);
+        auto addItem = reinterpret_cast<void* (*)(void*, void*)>(g_base + kChestAddItemOff);
+        auto addToBag = reinterpret_cast<int (*)(void*, void*, int)>(g_base + kAddToInventoryOff);
+        auto gainXp = reinterpret_cast<void (*)(void*, int, int)>(g_base + kGainXpOff);
+        auto forageLevel = reinterpret_cast<int (*)(void*)>(g_base + kForagingLevelOff);
+
+        int sheet = 0;
+        if (!NetIntAt(tf, 0x50u, &sheet) || sheet != 1) {
+            return false;
+        }
+        void* id = getProduce(tf);
+        if (id == nullptr || !Plausible(id)) {
+            return false;
+        }
+        int size = 0;
+        (void)NetIntAt(tf, 0x40u, &size);
+        int n = 1;
+        if (size != 3) {
+            int lvl = forageLevel != nullptr ? forageLevel(pl) : 0;
+            if (lvl < 0 || lvl > 40) {
+                lvl = 0;
+            }
+            n = ((tx + ty) & 1 ? 2 : 1) + lvl / 4;
+            if (n < 1) {
+                n = 1;
+            }
+            if (n > 6) {
+                n = 6;
+            }
+        }
+        int placed = 0;
+        for (int k = 0; k < n; ++k) {
+            void* item = createItem(id, 1, 0, nullptr);
+            if (item == nullptr || !Plausible(item)) {
+                break;
+            }
+            if (chest != nullptr && addItem(chest, item) == nullptr) {
+                ++placed;
+                continue;
+            }
+            if (chest == nullptr && chestCount > 0 && StoreInGroup(item, chestCount)) {
+                ++placed;
+                continue;
+            }
+            if (addToBag(pl, item, 0)) {
+                ++placed;
+                continue;
+            }
+            break;
+        }
+        if (placed == 0) {
+            return false;
+        }
+        void* slot = NetValueSlot(tf, 0x50u, 4u);
+        if (slot != nullptr) {
+            *reinterpret_cast<int*>(slot) = 0;
+        }
+        int check = -1;
+        if (!NetIntAt(tf, 0x50u, &check) || check != 0) {
+            if (s_bushResetFail < 4u) {
+                ++s_bushResetFail;
+                LOGF("bush: tileSheetOffset reset did not stick");
+            }
+            return false;
+        }
+        setUpRect(tf);
+        if (gainXp != nullptr) {
+            gainXp(pl, 2, placed);
+        }
+        if (s_autoOutput < 0xFu) {
+            ++s_autoOutput;
+        }
+        return true;
+    }
+
+    /* v513: fruit on a fruit tree.  `fruit` is a NetList<Item> at tree+0x68;
+     * the count NetInt sits at list+0x50 (value +0x68).  The indexer and Clear
+     * slots are read off FruitTree.shake: 0x200 (+0x208 adjustor) gets an item,
+     * 0x250 (+0x258) clears the list.  Both function pointers are required to
+     * point into the module text, so a wrong vtable can only skip.
+     *
+     * Vanilla's shake turns every fruit into Debris and then clears the list;
+     * here each item goes to the chest (or the group's chests / the bag) and the
+     * list is cleared once something was placed -- leaving a cleared tree with
+     * stolen fruit would duplicate on the next pass. */
+    bool HarvestFruitTreeAt(void* tf, void* pl, void* chest, int chestCount) {
+        if (!RangeReadable(static_cast<char*>(tf) + 0x68u, sizeof(void*))) {
+            return false;
+        }
+        void* ref = *reinterpret_cast<void**>(static_cast<char*>(tf) + 0x68u);
+        if (ref == nullptr || !Plausible(ref) ||
+            !RangeReadable(static_cast<char*>(ref) + 0x50u, sizeof(void*))) {
+            return false;
+        }
+        void* cntRef = *reinterpret_cast<void**>(static_cast<char*>(ref) + 0x50u);
+        if (cntRef == nullptr || !Plausible(cntRef) ||
+            !RangeReadable(static_cast<char*>(cntRef) + kNetValueOff2, 4u)) {
+            return false;
+        }
+        const int n = *reinterpret_cast<int*>(static_cast<char*>(cntRef) + kNetValueOff2);
+        if (n <= 0 || n > 16) {
+            return false;
+        }
+        void* mt = *reinterpret_cast<void**>(ref);
+        if (mt == nullptr || !Plausible(mt)) {
+            return false;
+        }
+        void* vt = *reinterpret_cast<void**>(static_cast<char*>(mt) + 8);
+        if (vt == nullptr || !Plausible(vt)) {
+            return false;
+        }
+        void* getItem = *reinterpret_cast<void**>(static_cast<char*>(vt) + 0x200u);
+        const unsigned char adjI = *reinterpret_cast<unsigned char*>(
+            static_cast<char*>(vt) + 0x208u);
+        void* clearFn = *reinterpret_cast<void**>(static_cast<char*>(vt) + 0x250u);
+        const unsigned char adjC = *reinterpret_cast<unsigned char*>(
+            static_cast<char*>(vt) + 0x258u);
+        const uintptr_t textEnd = g_base + 0x7C46000u;
+        const uintptr_t gi = reinterpret_cast<uintptr_t>(getItem);
+        const uintptr_t cf = reinterpret_cast<uintptr_t>(clearFn);
+        if (gi <= g_base || gi >= textEnd || cf <= g_base || cf >= textEnd) {
+            return false;
+        }
+        auto addItem = reinterpret_cast<void* (*)(void*, void*)>(g_base + kChestAddItemOff);
+        auto addToBag = reinterpret_cast<int (*)(void*, void*, int)>(g_base + kAddToInventoryOff);
+        int placed = 0;
+        for (int k = 0; k < n; ++k) {
+            void* item = reinterpret_cast<void* (*)(void*, int)>(getItem)(
+                static_cast<char*>(ref) + adjI, k);
+            if (item == nullptr || !Plausible(item)) {
+                continue;
+            }
+            if (chest != nullptr && addItem(chest, item) == nullptr) {
+                ++placed;
+                continue;
+            }
+            if (chest == nullptr && chestCount > 0 && StoreInGroup(item, chestCount)) {
+                ++placed;
+                continue;
+            }
+            if (addToBag(pl, item, 0)) {
+                ++placed;
+                continue;
+            }
+            break;
+        }
+        if (placed == 0) {
+            return false;
+        }
+        reinterpret_cast<void (*)(void*)>(clearFn)(static_cast<char*>(ref) + adjC);
+        if (s_autoOutput < 0xFu) {
+            ++s_autoOutput;
+        }
+        return true;
+    }
+
+    /* One anchor tile: look in its +/-2 window, harvest the first bush whose
+     * bounding box really touches it. */
+    bool HarvestBushNear(void* dict, void* unwrapFn, void* ndBase, void* here,
+                         void* pl, int ax, int ay, void* chest, int chestCount) {
+        auto tryGet = reinterpret_cast<bool (*)(void*, Vec2, void**)>(g_base + kTryGetValueOff);
+        void* bushBody = reinterpret_cast<void*>(g_base + kBushUseBodyOff);
+        const int anchorPx = ax * 64;
+        const int anchorPy = ay * 64;
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                const int tx = ax + dx;
+                const int ty = ay + dy;
+                const Vec2 key{static_cast<float>(tx), static_cast<float>(ty)};
+                void* raw = nullptr;
+                if (!tryGet(dict, key, &raw) || raw == nullptr || !Plausible(raw)) {
+                    continue;
+                }
+                void* tf = raw;
+                if (unwrapFn != nullptr) {
+                    tf = reinterpret_cast<void* (*)(void*, void*)>(unwrapFn)(ndBase, raw);
+                }
+                if (tf == nullptr || !Plausible(tf)) {
+                    continue;
+                }
+                const void* cls = VSlot(tf, kTfUseActionSlotOff);
+                const bool isBush = cls == bushBody;
+                const bool isFruit =
+                    cls == reinterpret_cast<void*>(g_base + kFruitTreeUseBodyOff);
+                if (!isBush && !isFruit) {
+                    continue;
+                }
+                void* boxFn = VSlot(tf, kTfBoxSlotOff);
+                if (boxFn == nullptr) {
+                    continue;
+                }
+                const Rect4i r = reinterpret_cast<Rect4i (*)(void*)>(boxFn)(tf);
+                if (!(r.x <= anchorPx + 64 && anchorPx <= r.x + r.w &&
+                      r.y <= anchorPy + 64 && anchorPy <= r.y + r.h)) {
+                    continue;
+                }
+                void* getLoc = VSlot(tf, 0x40u);
+                if (getLoc == nullptr) {
+                    continue;
+                }
+                if (reinterpret_cast<void* (*)(void*)>(getLoc)(tf) != here) {
+                    continue;
+                }
+                if (isFruit) {
+                    if (!HarvestFruitTreeAt(tf, pl, chest, chestCount)) {
+                        continue;
+                    }
+                    s_bushHitX0 = r.x;
+                    s_bushHitY0 = r.y;
+                    s_bushHitW = r.w;
+                    s_bushHitH = r.h;
+                    return true;
+                }
+                if (!HarvestBushAt(tf, tx, ty, pl, chest, chestCount)) {
+                    continue;
+                }
+                s_bushHitX0 = r.x;
+                s_bushHitY0 = r.y;
+                s_bushHitW = r.w;
+                s_bushHitH = r.h;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* v517: a path/flooring tile connects, exactly like it does for machines.
+     * When an anchor's orthogonal neighbour is a connector, that neighbour
+     * becomes an anchor too, so "chest -- path -- tea bush" works even in a
+     * location with no machines at all. */
+    void AddConnectorNeighbours(void* dict, int x, int y) {
+        static const int ddx[4] = {1, -1, 0, 0};
+        static const int ddy[4] = {0, 0, 1, -1};
+        for (int i = 0; i < 4; ++i) {
+            const int nx = x + ddx[i];
+            const int ny = y + ddy[i];
+            if (ConnectorAt(dict, static_cast<float>(nx), static_cast<float>(ny))) {
+                AddAnchor(nx, ny);
+            }
+        }
+    }
+
+    /* Walk the anchor set; every bush that gets harvested adds its own tiles as
+     * anchors, so the chain keeps going outward. */
+    void HarvestChain(void* dict, void* unwrapFn, void* ndBase, void* here,
+                      void* pl, void* soleChest, int chestCount) {
+        int done = 0;
+        for (int a = 0; a < s_anchorN && done < 24; ++a) {
+            const int ax = s_anchorX[a];
+            const int ay = s_anchorY[a];
+            /* paths continue the chain, with or without a machine in it */
+            AddConnectorNeighbours(dict, ax, ay);
+            if (!HarvestBushNear(dict, unwrapFn, ndBase, here, pl, ax, ay,
+                                 soleChest, chestCount)) {
+                continue;
+            }
+            ++done;
+            const int x0 = s_bushHitX0 / 64;
+            const int y0 = s_bushHitY0 / 64;
+            const int x1 = (s_bushHitX0 + s_bushHitW - 1) / 64;
+            const int y1 = (s_bushHitY0 + s_bushHitH - 1) / 64;
+            for (int ty = y0; ty <= y1; ++ty) {
+                for (int tx = x0; tx <= x1; ++tx) {
+                    AddAnchor(tx, ty);
+                }
+            }
+        }
+    }
+
+    /* Seeds: registered chests.  Works in a location with no machines at all. */
+    void CollectBushes() {
+        if (s_regChestCount <= 0) {
+            return;
+        }
+        void* pl = CarryPlayer();
+        if (pl == nullptr) {
+            return;
+        }
+        void* here = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        if (here == nullptr || !Plausible(here)) {
+            return;
+        }
+        if (!RangeReadable(static_cast<char*>(here) + kTerrainFeaturesOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* nd = *reinterpret_cast<void**>(static_cast<char*>(here) + kTerrainFeaturesOff);
+        if (nd == nullptr || !Plausible(nd) ||
+            !RangeReadable(static_cast<char*>(nd) + kNetDictInnerOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* dict = *reinterpret_cast<void**>(static_cast<char*>(nd) + kNetDictInnerOff);
+        if (dict == nullptr || !Plausible(dict)) {
+            return;
+        }
+        void* unwrapFn = nullptr;
+        void* ndBase = nullptr;
+        {
+            void* ndMt = *reinterpret_cast<void**>(nd);
+            if (ndMt != nullptr && Plausible(ndMt)) {
+                void* ndVt = *reinterpret_cast<void**>(static_cast<char*>(ndMt) + 8);
+                if (ndVt != nullptr && Plausible(ndVt)) {
+                    unwrapFn = *reinterpret_cast<void**>(
+                        static_cast<char*>(ndVt) + kNetDictUnwrapSlotOff);
+                    const unsigned char adj = *reinterpret_cast<unsigned char*>(
+                        static_cast<char*>(ndVt) + kNetDictUnwrapSlotOff + 8);
+                    ndBase = static_cast<char*>(nd) + adj;
+                }
+            }
+        }
+        for (int c = 0; c < s_regChestCount; ++c) {
+            s_anchorN = 0;
+            AddAnchor(static_cast<int>(s_regChestX[c]),
+                      static_cast<int>(s_regChestY[c]));
+            HarvestChain(dict, unwrapFn, ndBase, here, pl, s_regChests[c], 0);
+        }
+    }
+
+    /* Seeds: every tile of the current group's flood (chests, machines and
+     * connectors), so the chain follows paths exactly like the machines do. */
+    void CollectGroupBushes(void* dict, void* unwrapFn, void* ndBase, void* here,
+                            void* pl) {
+        if (s_grpChestCount <= 0 || dict == nullptr || s_markCount <= 0) {
+            return;
+        }
+        s_anchorN = 0;
+        for (int i = 0; i < s_markCount; ++i) {
+            const unsigned key = static_cast<unsigned>(s_markKeys[i]);
+            AddAnchor(static_cast<int>((key >> 16) & 0xFFFFu),
+                      static_cast<int>(key & 0xFFFFu));
+        }
+        HarvestChain(dict, unwrapFn, ndBase, here, pl, nullptr, s_grpChestCount);
+    }
+
+    /* Gather the plumbing and run the group pass for the group just built. */
+    void CollectGroupBushesNow() {
+        if (s_grpMachineCount <= 0 || s_grpChestCount <= 0) {
+            return;
+        }
+        void* pl = CarryPlayer();
+        if (pl == nullptr) {
+            return;
+        }
+        void* here = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        if (here == nullptr || !Plausible(here)) {
+            return;
+        }
+        if (!RangeReadable(static_cast<char*>(here) + kTerrainFeaturesOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* nd = *reinterpret_cast<void**>(static_cast<char*>(here) + kTerrainFeaturesOff);
+        if (nd == nullptr || !Plausible(nd) ||
+            !RangeReadable(static_cast<char*>(nd) + kNetDictInnerOff,
+                           sizeof(void*))) {
+            return;
+        }
+        void* dict = *reinterpret_cast<void**>(static_cast<char*>(nd) + kNetDictInnerOff);
+        if (dict == nullptr || !Plausible(dict)) {
+            return;
+        }
+        void* unwrapFn = nullptr;
+        void* ndBase = nullptr;
+        void* ndMt = *reinterpret_cast<void**>(nd);
+        if (ndMt != nullptr && Plausible(ndMt)) {
+            void* ndVt = *reinterpret_cast<void**>(static_cast<char*>(ndMt) + 8);
+            if (ndVt != nullptr && Plausible(ndVt)) {
+                unwrapFn = *reinterpret_cast<void**>(
+                    static_cast<char*>(ndVt) + kNetDictUnwrapSlotOff);
+                const unsigned char adj = *reinterpret_cast<unsigned char*>(
+                    static_cast<char*>(ndVt) + kNetDictUnwrapSlotOff + 8);
+                ndBase = static_cast<char*>(nd) + adj;
+            }
+        }
+        CollectGroupBushes(dict, unwrapFn, ndBase, here, pl);
     }
 
     /* Is this object a garden pot with a HoeDirt inside?  The pot is an
@@ -22294,7 +22809,9 @@ namespace {
                 ((static_cast<unsigned>(s_cropId < 0 ? 0xFFFF : s_cropId) &
                   0xFFFFu) << 16) |
                 (((s_cropFlags & 0xFu) | (cropKind << 4) |
-                  ((s_cropCount > 0) ? 0x80u : 0u)) << 8) |
+                  ((s_cropCount > 0) ? 0x80u : 0u) |
+                  ((s_cropFlags & 0x200u) ? 0x40u : 0u) |
+                  ((s_cropFlags & 0xC00u) ? 0x20u : 0u)) << 8) |
                 (static_cast<unsigned>(s_cropDays < 0 ? 0xFEu : s_cropDays) &
                  0xFFu);
             if (g_cropOn == 0) {
@@ -22326,6 +22843,21 @@ namespace {
                             state[sl++] = u' ';
                             state[sl++] = u'\u4E2A';                        /* 个 */
                         }
+                        else if ((s_cropFlags & 0x200u) != 0 && s_cropDays > 0) {
+                            /* v514: young tree -> days until it can bear fruit */
+                            static const char16_t kNeed[] = u"\u8FD8\u9700"; /* 还需 */
+                            for (int i = 0; kNeed[i] != 0 && sl < 6; ++i) {
+                                state[sl++] = kNeed[i];
+                            }
+                            state[sl++] = u' ';
+                            sl = AppendUnsigned(state, sl,
+                                                static_cast<unsigned>(s_cropDays));
+                            state[sl++] = u' ';
+                            static const char16_t kDays[] = u"\u5929";       /* 天 */
+                            for (int i = 0; kDays[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kDays[i];
+                            }
+                        }
                         else {
                             for (int i = 0; kNoFruit[i] != 0 && sl < 12; ++i) {
                                 state[sl++] = kNoFruit[i];
@@ -22333,10 +22865,43 @@ namespace {
                         }
                     }
                     else if (cropKind == 2u) {
-                        const char16_t* st =
-                            (s_cropFlags & 0x100u) != 0 ? kReady : kUnripe;
-                        for (int i = 0; st[i] != 0 && sl < 12; ++i) {
-                            state[sl++] = st[i];
+                        if ((s_cropFlags & 0x100u) != 0) {
+                            for (int i = 0; kReady[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kReady[i];
+                            }
+                        }
+                        else if ((s_cropFlags & 0x400u) != 0) {
+                            static const char16_t kW[] =
+                                u"\u51AC\u5B63\u505C\u4EA7";   /* 冬季停产 */
+                            for (int i = 0; kW[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kW[i];
+                            }
+                        }
+                        else if ((s_cropFlags & 0x800u) != 0) {
+                            static const char16_t kT[] = u"\u660E\u5929"; /* 明天 */
+                            for (int i = 0; kT[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kT[i];
+                            }
+                        }
+                        else if ((s_cropFlags & 0x200u) != 0 && s_cropDays > 0) {
+                            /* v509: tea bush that cannot produce yet */
+                            static const char16_t kNeed[] = u"\u8FD8\u9700"; /* 还需 */
+                            for (int i = 0; kNeed[i] != 0 && sl < 6; ++i) {
+                                state[sl++] = kNeed[i];
+                            }
+                            state[sl++] = u' ';
+                            sl = AppendUnsigned(state, sl,
+                                                static_cast<unsigned>(s_cropDays));
+                            state[sl++] = u' ';
+                            static const char16_t kDays[] = u"\u5929";       /* 天 */
+                            for (int i = 0; kDays[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kDays[i];
+                            }
+                        }
+                        else {
+                            for (int i = 0; kUnripe[i] != 0 && sl < 12; ++i) {
+                                state[sl++] = kUnripe[i];
+                            }
                         }
                     }
                     else {
