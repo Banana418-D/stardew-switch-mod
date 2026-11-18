@@ -195,6 +195,18 @@ SD:/switch/.overlays/sdv_items.ovl
 
 验证：按 `+` →「选项」，能看到**锤子图标**的页签 = 加载成功。
 
+## 配套工具：存档转换器
+
+我自己做的在线工具，免费、不用装任何东西：
+
+**[sdv.tetriso.online](https://sdv.tetriso.online/)** —— 星露谷存档转换器 · PC ↔ Switch
+
+- **PC 存档 → Switch**：PC 存档 zip + JKSV 备份 zip 拖进去，转出 JKSV 恢复包
+- **Switch 存档 → PC**：JKSV 备份转回 PC 存档，1.6 以上 PC 版直接读
+- 自带校验（自动解压读农场名/日期，检查 JKSV 包结构）和存档修改功能
+
+详细教程页面上就有（PC 端要装 SMAPI 睡一晚那种坑，页面里都写清楚了）。
+
 ## 功能
 
 | 功能 | 怎么用 |
