@@ -18,7 +18,8 @@
 **v1.12**（2026-11-19）
 - 新增：**骷髅洞电梯闭环**。电梯菜单任意层 ↔ 入口房 ↔ 回洞口，从入口房自己的门进出。
 - 新增：**矿车网络**。矿车新增 10 个目的地（社区中心、沙漠、铁路、火山口、姜岛等），
-  坐车画面同步画上车；靠 romfs 里的 `Data/Minecarts.xnb` 实现，删掉这个文件就退回原版 4 个目的地。
+  坐车画面同步画上车；靠 romfs 里的 `Data/Minecarts.xnb` + 13 张地图贴图实现，
+  删掉 romfs 里的 `Content/Data/Minecarts.xnb` 和 `Content/Maps/` 就退回原版 4 个目的地。
 - 新增：**酱料女皇提示**。左上角显示当天/重播菜谱的菜图与中文名，学会了就消失。
 - 新增：**献祭物品提示**。手里拿着社区中心收集包还缺的物品时，左上角写
   「献祭物品要求 包名 0/N」；Mod 页可单独关掉（默认开）。
@@ -153,13 +154,15 @@ SD:/atmosphere/contents/0100E65002BB8000/exefs/subsdk8
 SD:/atmosphere/contents/0100E65002BB8000/exefs/main.npdm
 SD:/atmosphere/contents/0100E65002BB8000/cheats/E7F845093E8CBC68.txt
 SD:/atmosphere/contents/0100E65002BB8000/romfs/Content/Data/Minecarts.xnb
+SD:/atmosphere/contents/0100E65002BB8000/romfs/Content/Maps/*.xnb        （13 张，矿车目的地对应的上车贴图）
 SD:/atmosphere/contents/4200000000000FF1/exefs.nsp
 SD:/atmosphere/contents/4200000000000FF1/flags/boot2.flag
 SD:/switch/.overlays/sdv_items.ovl
 ```
 
 `subsdk8` 和 `main.npdm` 缺一个就不工作。`sdv_items.ovl` 是插件，可以不装。
-`Minecarts.xnb` 是矿车新目的地的数据，删掉就只剩原版 4 个目的地，其余功能不受影响。
+`Minecarts.xnb` 和 `Maps/` 里那 13 张贴图是矿车新目的地的数据，删掉就只剩
+原版 4 个目的地（地图不再显示车），其余功能不受影响。
 `4200000000000FF1` 是日志模块（logd），`boot2.flag` 让它开机自启；不想要日志就删掉
 整个 `4200000000000FF1` 文件夹，游戏本体不受影响。日志写在
 `SD:/sdv_native/logs/`，闪退卡死后拿它提 issue。
@@ -173,7 +176,7 @@ SD:/switch/.overlays/sdv_items.ovl
 | 左上角信息 | 明日天气（含节日名）、今日运气、今日生日（含「最爱 X·Y」）、酱料女皇菜谱、献祭物品提示、工具升级 |
 | 献祭物品提示 | 手上是社区中心收集包还缺的东西时，左上角写「献祭物品要求 包名 0/N」；Mod 页可关 |
 | 骷髅洞电梯 | 矿洞电梯任意层 ↔ 入口房 ↔ 回洞口，入口房有自己的门 |
-| 矿车 | 新增 10 个目的地（社区中心/沙漠/铁路/火山口/姜岛等）；不想要就删 `Minecarts.xnb` |
+| 矿车 | 新增 10 个目的地（社区中心/沙漠/铁路/火山口/姜岛等）；不想要就删 romfs 里的 `Minecarts.xnb` 和 `Content/Maps/` |
 | 礼物口味提示 | 日历停在生日那天，或社交页停在村民身上 → 弹出他最喜欢的礼物（带图标） |
 | 作物提示 | 走到作物前，格子上方写「作物名 / 还剩几天·浇没浇水」 |
 | 机器提示 | 走到熔炉、小桶、木桶、蟹笼前，写「产物 / 还剩多久」；木桶标出下一档品质星 |
