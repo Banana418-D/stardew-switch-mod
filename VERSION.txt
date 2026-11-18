@@ -2,7 +2,7 @@ Stardew Valley (Switch) native mod -- package manifest
 
 版本          v1.12
 构建          v658-fb86ed2d
-打包时间      2026-11-19 00:41
+打包时间      2026-11-19 00:46
 
 subsdk8       md5 fb86ed2d6d7eb7dd62697cd45f0e686c
               235082 字节
@@ -15,7 +15,7 @@ cheats .txt   md5 dff9b9d9c985f91d69a11a067c6012bc
 horse.xnb     md5 4b8612f33b2eced80d62d3f186b6f88e
               229461 字节（可选外观，删掉就是原版马）
 Minecarts.xnb md5 4274ece3eb6aab063fda2646ebb2f8ef
-              2404 字节（矿车新目的地数据，删掉只剩原版 4 个目的地）
+              2404 字节（矿车新目的地数据，另附 13 张地图上车贴图；全删只剩原版 4 个目的地）
 logd exefs.nsp md5 aa6d30b511be66ff3e9e4f1b472be3be
               76206 字节（日志模块，随开机自启）
 
