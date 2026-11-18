@@ -306,8 +306,9 @@ Atmosphère **默认让文件里所有段全部生效**，不是只开第一段�
 
 ## 说明
 
-- 包内有两张来自游戏本体的数据文件：拖拉机外观 `horse.xnb`（删掉变回原版马）和
-  矿车数据 `Minecarts.xnb`（删掉退回原版 4 个目的地），其余全是代码
+- 包内来自游戏本体的数据：拖拉机外观 `horse.xnb`（删掉变回原版马）和矿车数据
+  （`Minecarts.xnb` + 13 张地图上车贴图，删掉退回原版 4 个目的地、地图不显示车），
+  其余全是代码
 - 基于 GPLv2 的 [exlaunch](https://github.com/shadowninja108/exlaunch) 构建，
   许可证见 `LICENSE`，第三方声明见 `NOTICE.md`
 - 所有功能都在实机（Atmosphère）上测过

@@ -21,15 +21,18 @@ kept next to the thing it builds rather than behind a separate download.
 ## Stardew Valley
 
 Stardew Valley is (c) ConcernedApe. This package contains **no** game code and
-exactly two files derived from retail game data: `romfs/Content/Animals/horse.xnb`,
-the optional tractor appearance, and `romfs/Content/Data/Minecarts.xnb`, the
-minecart destination table (the vanilla file plus ten entries, so the carts can
-reach the volcano, the desert and the rest). The horse sheet's top half is the
-vanilla horse sheet, pixel for pixel, and Minecarts.xnb starts from the vanilla
-table -- those files are game data and are not ours to license; they are shipped
-because the game can only load a replacement as a whole, and each can be removed
-by deleting that one file without affecting anything else. Everything else in
-the package is code that runs alongside the game the user already owns.
+only files derived from retail game data under `romfs/`: `Animals/horse.xnb`,
+the optional tractor appearance, and the minecart set -- `Data/Minecarts.xnb`
+(the vanilla destination table plus ten entries, so the carts can reach the
+volcano, the desert and the rest) plus thirteen `Maps/*.xnb` cart overlays
+(vanilla maps with the carts drawn on, so the new destinations show a cart).
+The horse sheet's top half is the vanilla horse sheet, the maps are the vanilla
+maps, and Minecarts.xnb starts from the vanilla table -- those files are game
+data and are not ours to license; they are shipped because the game can only
+load a replacement as a whole, and each can be removed by deleting it without
+affecting anything else (the cart overlays fall back to the game's own maps,
+which simply do not show a cart). Everything else in the package is code that
+runs alongside the game the user already owns.
 
 ## Tractor Mod -- Pathoschild (MIT)
 
