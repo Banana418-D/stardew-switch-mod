@@ -14,6 +14,7 @@
 #define TESLA_INIT_IMPL
 #include <tesla.hpp>
 #include <switch.h>
+#include <sys/stat.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -40,17 +41,37 @@ namespace {
 // read from a PC without asking anyone to transcribe numbers.
 bool gFsMounted = false;
 
+// v27: every file this overlay leaves on the card lives in one folder, and it
+// is the same folder the mod writes into (source/program/sdlog.cpp makes
+// sdmc:/sdv_native).  The SD root was collecting sdv_log.txt, sdv_map.txt,
+// sdv_rtld.bin, sdv_salty.bin and sdv_items.cfg right next to the game's own
+// files; now one folder holds the lot and "copy that folder" is the whole
+// instruction.
+constexpr const char* kDir     = "sdmc:/sdv_native";
+// v28: diagnostics live one level down, so deleting the log folder does not
+// take the settings file with it (the mod does the same, see sdlog.cpp).
+constexpr const char* kLogDir  = "sdmc:/sdv_native/logs";
+constexpr const char* kLogPath = "sdmc:/sdv_native/logs/sdv_log.txt";
+
+// 402 = "already exists", which is the answer from the second launch on; a card
+// that refuses to make the directory falls back to the root paths below, because
+// losing the log is worse than an untidy root.
+void ensureSd() {
+    if (gFsMounted) return;
+    fsdevMountSdmc();
+    gFsMounted = true;
+    mkdir(kDir, 0777);
+    mkdir(kLogDir, 0777);
+}
+
 // Error lines are prefixed with "!! " so the rotation step can keep them while
 // dropping the routine ones.  Losing the one line that explained a failure is
 // worse than keeping a file that slowly grows.
 void logWrite(const char* prefix, const char* fmt, va_list ap) {
-    if (!gFsMounted) {
-        fsdevMountSdmc();
-        gFsMounted = true;
-    }
+    ensureSd();
 
     {
-        FILE* probe = std::fopen("sdmc:/sdv_log.txt", "r");
+        FILE* probe = std::fopen(kLogPath, "r");
         if (probe) {
             std::fseek(probe, 0, SEEK_END);
             const long size = std::ftell(probe);
@@ -59,7 +80,7 @@ void logWrite(const char* prefix, const char* fmt, va_list ap) {
                 // Keep every error line, drop the rest.
                 static char keep[16 * 1024];
                 size_t kept = 0;
-                FILE* in = std::fopen("sdmc:/sdv_log.txt", "r");
+                FILE* in = std::fopen(kLogPath, "r");
                 if (in) {
                     char line[256];
                     while (std::fgets(line, sizeof(line), in)) {
@@ -73,7 +94,7 @@ void logWrite(const char* prefix, const char* fmt, va_list ap) {
                     }
                     std::fclose(in);
                 }
-                FILE* out = std::fopen("sdmc:/sdv_log.txt", "w");
+                FILE* out = std::fopen(kLogPath, "w");
                 if (out) {
                     if (kept) std::fwrite(keep, 1, kept, out);
                     std::fclose(out);
@@ -82,7 +103,7 @@ void logWrite(const char* prefix, const char* fmt, va_list ap) {
         }
     }
 
-    FILE* f = std::fopen("sdmc:/sdv_log.txt", "a");
+    FILE* f = std::fopen(kLogPath, "a");
     if (!f) return;
     std::fputs(prefix, f);
     std::vfprintf(f, fmt, ap);
@@ -130,8 +151,8 @@ constexpr u64 kTitleId     = 0x0100E65002BB8000ULL;   // Stardew Valley
 // Six characters on purpose: a four-character literal gets inlined as a
 // movz/movk pair instead of landing in .rodata, which makes "did this build
 // pick up my version string?" impossible to answer with strings(1).
-constexpr const char* kBuild = "v1.0.9";
-constexpr int         kBuildSeq = 22;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, 22-23 = v1.0.9, ...
+constexpr const char* kBuild = "v1.1.8";
+constexpr int         kBuildSeq = 36;  // 6-7 = v1.0.1, 8-9 = v1.0.2, 10-11 = v1.0.3, 12-13 = v1.0.4, 14-15 = v1.0.5, 16-17 = v1.0.6, 18-19 = v1.0.7, 20-21 = v1.0.8, 22-23 = v1.0.9, 24-25 = v1.1.0, 26-27 = v1.1.1, 28-29 = v1.1.2, 30-31 = v1.1.3, 32 = v1.1.4 (mod RAM log export), 33 = v1.1.5 (no worker thread), 34 = v1.1.6 (sessions counted and released), 36 = v1.1.8 (mod-log export removed; sdv_logd owns it), ...
 // One round of "record the memory layout, touch nothing".  Flip to false once the
 // chain under 0x0BB90280 is understood.
 constexpr bool kDiagOnly = false;
@@ -178,6 +199,66 @@ std::string settingsText() {
 }
 
 bool gOpen = false;
+
+/* v34: dmnt:cht / sm sessions are a REFERENCE COUNT inside this .ovl
+ * (NX_GENERATE_SERVICE_GUARD in dmntcht.c), but a Tesla overlay is dlopen'd
+ * and dlclose'd every time its menu opens and closes.  The count lives in the
+ * module, so unloading it forgets the count while the kernel-side sessions
+ * stay open in ovlloader -- which is a long-lived process.
+ *
+ * v33's read-only log export called dmntchtInitialize() once per tick and
+ * detach() early-returned when nothing had been attached, so every single menu
+ * open leaked one sm: and one dmnt:cht session into ovlloader.  After a dozen
+ * opens dmnt runs out of sessions and every other overlay reports
+ * "不在游戏中，或作弊服务启动失败" (the cheat plugin could no longer reach
+ * dmnt:cht at all).  Leaked sessions survive the game exiting: only a console
+ * reboot clears them.
+ *
+ * Everything in this file that opens a service now goes through these three
+ * helpers, and exitServices() empties the counters before the .ovl is
+ * unloaded, so the process the overlay host sees never accumulates sessions. */
+static int g_smRefs = 0;
+static int g_dmntRefs = 0;
+
+static Result svcAcquire() {
+    if (g_smRefs == 0) {
+        Result rc = smInitialize();
+        if (R_FAILED(rc)) return rc;
+    }
+    ++g_smRefs;
+    if (g_dmntRefs == 0) {
+        Result rc = dmntchtInitialize();
+        if (R_FAILED(rc)) {
+            if (--g_smRefs == 0) smExit();
+            return rc;
+        }
+    }
+    ++g_dmntRefs;
+    return 0;
+}
+
+static void svcRelease() {
+    if (g_dmntRefs > 0) {
+        dmntchtExit();
+        --g_dmntRefs;
+    }
+    if (g_smRefs > 0) {
+        smExit();
+        --g_smRefs;
+    }
+}
+
+/* Last line of defence before dlclose: whatever is still counted goes. */
+static void svcReleaseAll() {
+    while (g_dmntRefs > 0) {
+        dmntchtExit();
+        --g_dmntRefs;
+    }
+    while (g_smRefs > 0) {
+        smExit();
+        --g_smRefs;
+    }
+}
 u64  gNsoBase = 0;
 u64  gNsoSize = 0;
 // The pid is only needed by the memory map export, which asks the kernel about
@@ -234,7 +315,7 @@ constexpr u64 kRtldDelta    = 0x006000;
 constexpr u64 kRtldSize     = 0x003000;
 constexpr u64 kSaltyDelta   = 0x206000;
 constexpr u64 kSaltySize    = 0x01C000;
-constexpr const char* kMapPath = "sdmc:/sdv_map.txt";
+constexpr const char* kMapPath = "sdmc:/sdv_native/logs/sdv_map.txt";
 
 bool peekAbs(u64 addr, void* out, size_t size);
 bool attach();
@@ -381,8 +462,8 @@ void dumpRuntime() {
                     (unsigned)hdr[3]);
     }
 
-    const bool a = dumpRange("sdmc:/sdv_rtld.bin",  rtld,  kRtldSize);
-    const bool c = dumpRange("sdmc:/sdv_salty.bin", salty, kSaltySize);
+    const bool a = dumpRange("sdmc:/sdv_native/logs/sdv_rtld.bin",  rtld,  kRtldSize);
+    const bool c = dumpRange("sdmc:/sdv_native/logs/sdv_salty.bin", salty, kSaltySize);
     const bool b = dumpMemoryMap(gPid);
 
     // Nothing longer than fits next to the title: the subtitle is a single
@@ -1244,9 +1325,14 @@ void applySavedConfig() {
         // would turn a quiet menu into "挂载失败" for anyone who opens the
         // overlay before launching the game.  Once a give has attached, the
         // call above is false and the enforcement below runs.
+        logLine("config: nothing to enforce, not attaching");
         return;
     }
-    if (!attach()) return;
+    if (!attach()) {
+        logLine("config: attach failed, nothing applied");
+        return;
+    }
+    logLine("config: attached, applying");
     setOneHitKill(gCfg.oneHitKill, true);
     setAutoWater(gCfg.autoWater, true);
     setAllRecipes(gCfg.allRecipes, true);
@@ -1521,11 +1607,29 @@ constexpr WordPatch kFishSites[] = {
 };
 constexpr int kFishCount = (int)(sizeof(kFishSites) / sizeof(kFishSites[0]));
 
-// Stamina.  Three getters, each replaced by `mov w0, #60000`.
+// Stamina.  "不减" is done on the setter, not on the getter.
+//
+// The getter returns a FLOAT:
+//
+//   013B9270  ldr x8, [x0, #0x588]     ; netStamina
+//   013B9274  ldr s0, [x8, #0x68]
+//   013B9278  ret
+//
+// The old patch replaced that ldr with `mov w0, #60000`, copied from the money
+// accessor, which returns an int in w0.  Here the result is in s0, so the patch
+// did not change what the getter returned at all -- it returned whatever the
+// caller had left in s0.  Every tool use then read garbage, subtracted its cost
+// and wrote the result back through the setter, so the real stamina was
+// destroyed and checkForExhaustion fired.
+//
+// set_Stamina (013B9280) already contains the rule this feature wants: when it
+// reaches 013B92C0 it compares the incoming value with the current one and
+// returns without writing if the new value is lower.  In vanilla that path is
+// gated by a flag from 0x11E4100; NOPing the tbz makes the comparison run
+// every time, so stamina can go up (sleep, food, clamp) but never down.  The
+// getters stay untouched, so the HUD and every caller see the real value.
 constexpr WordPatch kStaminaSites[] = {
-    { 0x13B9274ULL, 0xBD406900u, 0x529D4C00u },
-    { 0x13B7404ULL, 0xBD406900u, 0x529D4C00u },
-    { 0x13CB7E8ULL, 0xBD406900u, 0x529D4C00u },
+    { 0x13B92C0ULL, 0x36000120u, 0xD503201Fu },   // tbz w0,#0 -> nop
 };
 constexpr int kStaminaCount = (int)(sizeof(kStaminaSites) / sizeof(kStaminaSites[0]));
 
@@ -1692,6 +1796,11 @@ void checkToggleConsistency() {
     logLine("toggles: memory and config agree (all 11 switches)");
 }
 
+// Set once the saved switches have been written back for the current handle.
+// build 26 moved the enforcement from "menu open" to "first connect" (see
+// attach()), so this is what keeps it to one pass per attach.
+static bool s_configEnforced = false;
+
 bool attach() {
     if (gOpen) return true;
 
@@ -1704,8 +1813,19 @@ bool attach() {
         if (!attachOnce()) return false;
 
         u32 probe = 0;
-        if (peek(kScratch, &probe, sizeof(probe)) && poke(kScratch, &probe, sizeof(probe)))
+        if (peek(kScratch, &probe, sizeof(probe)) && poke(kScratch, &probe, sizeof(probe))) {
+            // build 26: the saved switches are enforced here, on the first real
+            // connect, instead of when the menu opens.  Opening the menu used
+            // to stop the game (dmnt attach) at the one moment the game may be
+            // building its own chat/emote menu from the same button; that race
+            // is what froze consoles and aborted the overlay.  Nothing is
+            // attached until an action needs the game, and this is that moment.
+            if (!s_configEnforced) {
+                s_configEnforced = true;   // before the call: it re-enters attach()
+                applySavedConfig();
+            }
             return true;
+        }
 
         logError("  handle opened but is not writable, reopening (%d/4)", attempt + 1);
         detach();
@@ -1723,9 +1843,16 @@ static bool attachOnce() {
     // always failed, the probe below happened to initialise sm as a side
     // effect, and the second click worked - which is exactly the "press it
     // twice" behaviour this replaces.
-    smInitialize();
-
-    Result rc = dmntchtInitialize();
+    //
+    // build 24: every step is logged BEFORE the call, so a report whose log
+    // stops mid-attach names the call that never returned.  A blocked IPC
+    // cannot be timed out from here, so the log is the only channel; the
+    // console freezing while the overlay is open is consistent with
+    // dmntchtForceOpenCheatProcess stopping the game and never resuming it.
+    logLine("attach: smInitialize");
+    logLine("attach: dmntchtInitialize");
+    Result rc = svcAcquire();          /* v34: counted, see svcAcquire() */
+    logLine("attach: dmntchtInitialize rc=%08X", (unsigned)rc);
     if (R_FAILED(rc)) {
         std::snprintf(gStatus, sizeof(gStatus), "dmnt:cht 失败 %08X", (unsigned)rc);
         logError("dmntchtInitialize failed rc=%08X", (unsigned)rc);
@@ -1734,28 +1861,52 @@ static bool attachOnce() {
 
     // Attaching is the whole ballgame, and its result was never checked
     // before.  Close first so a stale half-open state cannot mask a failure.
-    dmntchtForceCloseCheatProcess();
-    Result rOpen = dmntchtForceOpenCheatProcess();
+    //
+    // build 24: ask FIRST.  When Atmosphère's cheat engine already has this
+    // process (dmnt_cheats_enabled_by_default + a cheat file for the title --
+    // our package ships one), ForceClose+ForceOpen tears down a handle that is
+    // working.  On the console that freezes, the single header line means the
+    // hang is in this block, so the handle we destroy is the prime suspect:
+    // use what is there, and only open one when there is none.
+    bool hasFirst = false;
+    Result rHasFirst = dmntchtHasCheatProcess(&hasFirst);
+    logLine("attach: HasCheatProcess (before) rc=%08X has=%d",
+            (unsigned)rHasFirst, (int)hasFirst);
+    Result rOpen = 0;
+    if (R_SUCCEEDED(rHasFirst) && hasFirst) {
+        logLine("attach: already attached, leaving the handle alone");
+    }
+    else {
+        logLine("attach: ForceCloseCheatProcess");
+        dmntchtForceCloseCheatProcess();
+        logLine("attach: ForceOpenCheatProcess");
+        rOpen = dmntchtForceOpenCheatProcess();
+        logLine("attach: ForceOpenCheatProcess rc=%08X", (unsigned)rOpen);
+    }
 
     bool has = false;
     Result rHas = dmntchtHasCheatProcess(&has);
+    logLine("attach: HasCheatProcess rc=%08X has=%d", (unsigned)rHas, (int)has);
     if (R_FAILED(rOpen) || R_FAILED(rHas) || !has) {
         std::snprintf(gStatus, sizeof(gStatus), "挂载失败 开%08X 查%08X 有%d",
                       (unsigned)rOpen, (unsigned)rHas, has ? 1 : 0);
-        dmntchtExit();
+        svcRelease();
         return false;
     }
 
     DmntCheatProcessMetadata meta{};
+    logLine("attach: GetCheatProcessMetadata");
     Result rMeta = dmntchtGetCheatProcessMetadata(&meta);
+    logLine("attach: GetCheatProcessMetadata rc=%08X pid=%llu", (unsigned)rMeta,
+            (unsigned long long)meta.process_id);
     if (R_FAILED(rMeta)) {
         std::snprintf(gStatus, sizeof(gStatus), "元数据失败 %08X", (unsigned)rMeta);
-        dmntchtExit();
+        svcRelease();
         return false;
     }
     if (meta.title_id != kTitleId) {
         setStatus("当前不是星露谷");
-        dmntchtExit();
+        svcRelease();
         return false;
     }
 
@@ -1773,7 +1924,7 @@ static bool attachOnce() {
                  meta.main_nso_build_id[2], meta.main_nso_build_id[3],
                  meta.main_nso_build_id[4], meta.main_nso_build_id[5],
                  meta.main_nso_build_id[6], meta.main_nso_build_id[7]);
-        dmntchtExit();
+        svcRelease();
         return false;
     }
 
@@ -1837,14 +1988,20 @@ static bool attachOnce() {
 
 void detach() {
     if (!gOpen) return;
-    dmntchtExit();
+    svcRelease();              /* v34: counted release, never a raw Exit */
     gOpen = false;
+    s_configEnforced = false;   // the switch patch lives in .text: gone with the handle
 }
 
 // All offline addresses are offsets from the module base.  On hardware that
 // base is ASLR'd (measured 0x21ED006000 and 0x2A19806000 on consecutive
 // launches), so folding it in here is the only place it has to be right.
 bool poke(u64 off, const void* data, size_t size) {
+    // build 26: lazy connect.  Opening the menu no longer attaches (see
+    // ItemGui::createUI), so the first store that actually needs the game
+    // connects here.  Re-entrancy is not a concern: attachOnce() sets gOpen
+    // before it reads anything, so the probe inside attach() never recurses.
+    if (!gOpen && !attach()) return false;
     return R_SUCCEEDED(dmntchtWriteCheatProcessMemory(gNsoBase + off, data, size));
 }
 
@@ -1855,6 +2012,7 @@ bool peekAbs(u64 addr, void* out, size_t size) {
 }
 
 bool peek(u64 off, void* out, size_t size) {
+    if (!gOpen && !attach()) return false;
     return R_SUCCEEDED(dmntchtReadCheatProcessMemory(gNsoBase + off, out, size));
 }
 
@@ -2247,13 +2405,12 @@ constexpr int kClickGuardFrames = 8;
 // 90 px track bars would eat 250 of the 522 px content box and leave two result
 // rows on screen.  Persisting the setting is what makes "set it once" enough,
 // and the L/R shortcut on the result page covers changing it without leaving.
-constexpr const char* kCfgPath = "sdmc:/sdv_items.cfg";
+constexpr const char* kCfgPath = "sdmc:/sdv_native/sdv_items.cfg";
+// v27: the pre-folder location, read once so an existing config is not lost.
+constexpr const char* kCfgOld  = "sdmc:/sdv_items.cfg";
 
 void ensureFs() {
-    if (!gFsMounted) {
-        fsdevMountSdmc();
-        gFsMounted = true;
-    }
+    ensureSd();
 }
 
 void saveConfig() {
@@ -2274,6 +2431,14 @@ void saveConfig() {
 void loadConfig() {
     ensureFs();
     FILE* f = std::fopen(kCfgPath, "r");
+    bool migrated = false;
+    if (!f) {
+        // First run after v27: take the config left in the SD root and rewrite
+        // it into the folder, so the switches the user set are not silently
+        // reset by a path change.
+        f = std::fopen(kCfgOld, "r");
+        migrated = (f != nullptr);
+    }
     if (!f) return;
 
     char line[128];
@@ -2327,6 +2492,7 @@ void loadConfig() {
         }
     }
     std::fclose(f);
+    if (migrated) saveConfig();   // v27: one-time move out of the SD root
 }
 
 // L/R on the result page.  Step one notch and store it, so the choice survives
@@ -3764,10 +3930,29 @@ public:
         // it otherwise exists only in the title bar, which nobody photographs.
         logLine("=== sdv_overlay %s build %d (menu opened) ===", kBuild, kBuildSeq);
         loadConfig();
-        applySavedConfig();
+        // build 26: opening this menu must not touch the game.
+        //
+        // Attaching means dmnt stops the game process.  Doing that while the
+        // player is opening this menu -- and possibly while the game itself is
+        // building its chat box / emote menu from the very same button -- is the
+        // freeze this build chases: the console hangs, or the overlay host
+        // aborts with User Break (hbl).  Nothing here needs the game: the item
+        // lists are static tables.  The first action that actually reads or
+        // writes connects, and attach() then enforces the saved switches.
+        if (gOpen) {
+            // Already connected by an earlier action in this session, so this
+            // only re-reads the switches the game may have moved on its own.
+            applySavedConfig();
+        } else {
+            logLine("attach: deferred (menu opened, no game access yet)");
+            std::snprintf(gStatus, sizeof(gStatus), "未连接 · 操作时才连接");
+        }
         // Title carries the build tag (so a replaced .ovl is identifiable),
-        // subtitle carries the live status (so it survives scrolling).
-        auto frame = new tsl::elm::OverlayFrame(std::string("星露谷 物品 ") + kBuild, gStatus);
+        // subtitle carries the live status (so it survives scrolling).  The
+        // sequence number is in the title because "which build is actually
+        // installed" was otherwise unanswerable from a screenshot.
+        auto frame = new tsl::elm::OverlayFrame(
+            std::string("星露谷 物品 ") + kBuild + " b" + std::to_string(kBuildSeq), gStatus);
         mFrame = frame;
         auto list  = new tsl::elm::List();
 
@@ -3853,7 +4038,7 @@ public:
         });
         list->addItem(install);
 
-        // Diagnostic only: writes sdmc:/sdv_rtld.bin and sdmc:/sdv_salty.bin.
+        // Diagnostic only: writes sdmc:/sdv_native/logs/sdv_rtld.bin and sdv_salty.bin.
         // It sits in 设置 rather than at the top because it is a recovery tool,
         // not something to press on the way in; and it does not touch game
         // state, so it needs no explaining.
@@ -3954,8 +4139,17 @@ private:
 
 class ItemOverlay : public tsl::Overlay {
 public:
-    void initServices() override { }
-    void exitServices() override { detach(); }
+    void initServices() override { }   /* build 26: opening the menu must not touch the game */
+    void exitServices() override {
+        /* v34: this runs BEFORE ovlloader dlclose()s the .ovl.  Anything still
+         * counted here would stay open in ovlloader forever (the module's own
+         * ref-count disappears with the unload), so empty it unconditionally.
+         * This is what stops the "cheat service failed to start" leak: the
+         * read-only log path opens sm:/dmnt:cht without ever attaching, so
+         * detach() alone would early-return and leak both. */
+        detach();                 /* the game-side dmnt handle, if attached */
+        svcReleaseAll();          /* everything else, including the read-only path */
+    }
     std::unique_ptr<tsl::Gui> loadInitialGui() override {
         // Before the first Gui exists, so the track bars are built on the stored
         // values instead of the compile-time defaults (they only fire their

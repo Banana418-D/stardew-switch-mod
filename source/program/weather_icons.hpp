@@ -362,3 +362,17 @@ static constexpr IconRun kIcon_hud_tool[] = {
     {18,14,1,15,0xFF3C3436u},{13,29,6,1,0xFF3C3436u},
 };
 static constexpr IconTable kHud_tool{kIcon_hud_tool, 19};
+
+static constexpr IconRun kIcon_hud_qos[] = {
+    {7,2,3,2,0xFFDCD2D2u},{23,2,3,2,0xFFDCD2D2u},{9,4,1,2,0xFFDCD2D2u},{23,4,1,2,0xFFDCD2D2u},
+    {10,6,1,2,0xFFDCD2D2u},{22,6,1,2,0xFFDCD2D2u},{3,8,26,2,0xFF546EE2u},
+    {3,10,26,1,0xFF2434B2u},{3,11,3,15,0xFF2434B2u},{6,11,20,2,0xFF40281Cu},
+    {26,11,3,1,0xFF2434B2u},{26,12,2,4,0xFF78C8F0u},{28,12,1,4,0xFF2434B2u},
+    {6,13,6,1,0xFF40281Cu},{12,13,8,1,0xFFF8F8F8u},{20,13,6,1,0xFF40281Cu},
+    {6,14,4,4,0xFF40281Cu},{10,14,12,4,0xFFF8F8F8u},{22,14,4,4,0xFF40281Cu},
+    {26,16,3,10,0xFF2434B2u},{6,18,5,1,0xFF40281Cu},{11,18,10,1,0xFFDEDEDEu},
+    {21,18,5,1,0xFF40281Cu},{6,19,6,2,0xFF40281Cu},{12,19,8,2,0xFFEEEEEEu},
+    {20,19,6,2,0xFF40281Cu},{6,21,20,5,0xFF40281Cu},{3,26,26,1,0xFF2434B2u},
+    {3,27,26,2,0xFF141E78u},
+};
+static constexpr IconTable kHud_qos{kIcon_hud_qos, 29};

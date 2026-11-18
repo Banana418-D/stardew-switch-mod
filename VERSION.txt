@@ -1,19 +1,23 @@
 Stardew Valley (Switch) native mod -- package manifest
 
-版本          v1.11
-构建          v522-7287368c
-打包时间      2026-11-16 04:43
+版本          v1.12
+构建          v658-fb86ed2d
+打包时间      2026-11-19 00:41
 
-subsdk8       md5 7287368c22cc2c51a5ec9b405162a4a6
-              209237 字节
+subsdk8       md5 fb86ed2d6d7eb7dd62697cd45f0e686c
+              235082 字节
 main.npdm     md5 6f281d0b48f69eb26fdebb1ffd265ef6
               1516 字节
-sdv_items.ovl md5 b9dd8eacf90c507c5704a5bcfd6a9393
-              593976 字节
+sdv_items.ovl md5 7da2c0dfee57708893d1299d0706e279
+              643128 字节
 cheats .txt   md5 dff9b9d9c985f91d69a11a067c6012bc
               739 字节
 horse.xnb     md5 4b8612f33b2eced80d62d3f186b6f88e
               229461 字节（可选外观，删掉就是原版马）
+Minecarts.xnb md5 4274ece3eb6aab063fda2646ebb2f8ef
+              2404 字节（矿车新目的地数据，删掉只剩原版 4 个目的地）
+logd exefs.nsp md5 aa6d30b511be66ff3e9e4f1b472be3be
+              76206 字节（日志模块，随开机自启）
 
 适用游戏      Stardew Valley 1.6.15.13 (Switch)
 Title ID      0100E65002BB8000

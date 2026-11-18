@@ -44,15 +44,86 @@
 #include "program/worldmap_table.hpp"
 #include "program/tooltip_rect_table.hpp"
 #include "program/weather_icons.hpp"
+#include "program/bundle_table.hpp"
+#include "program/cooking_channel.hpp"
 #include "program/leo_head.hpp"
 #include "program/set_time.hpp"
 
 #include "program/sdlog.hpp"
+#include "program/ringlog.hpp"
 #include "program/offset_tables.hpp"
 
 
-/* Mirror a line to both the debug output and sdmc:/sdv_map.log. */
-#define LOGF(...) do { Logging.Log(EXL_LOG_PREFIX __VA_ARGS__); sdlog::Line(__VA_ARGS__); } while (0)
+/* Mirror a line to both the debug output and sdmc:/sdv_map.log.
+ *
+ * v641: g_logQuiet silences BOTH channels while there is no world.  sdlog's
+ * own SetGate() was added in v613 with a comment saying "the update hook
+ * closes it while there is no world" -- but it never had a single caller.
+ * That is the whole reason v617 (no hooks, therefore no log at all) was the
+ * only build that never froze on the character-creation screen: every other
+ * build kept an open fs handle and wrote to the card during the applet switch
+ * that brings up the system software keyboard. */
+static volatile unsigned g_logQuiet = 0;
+/* v646: logging is BACK.  v645 proved on hardware that the hang is caused by
+ * the fs SERVICE SESSIONS (sm:, fsp-srv, the SD-card FsFileSystem) being held
+ * for the whole process -- not by the text of the log, not by the FsFile, and
+ * not by any AOT null dereference.
+ *
+ * The fix is sdlog::Shutdown(): on the real "returned to title" edge we close
+ * all three sessions and reset the step machine, so the system-keyboard
+ * applet switch happens with ZERO fs sessions -- the cold-boot state v645
+ * proved safe.  Entering the next world re-runs Step() from step 0 after a
+ * fresh 600-frame warm-up (opening fs while the game mounts the save is
+ * SDLOG-1's exact hang), and the log is APPENDED, so every session stays in
+ * one readable file.
+ *
+ * v647: the channel is now ONE-SHOT per process -- opened once, closed once
+ * on the first long no-world window, never reopened.  v646 reopened it five
+ * times in one session (five session headers) and then flash-exited with no
+ * erpt report; cycling sm:/fsp-srv is the only new behaviour v646 added.
+ * The log covers the first world; a game restart starts a fresh log section.
+ *
+ * v648: the SD-card channel is GONE.  Every log line goes to a 128 KB RAM
+ * ring (ringlog.hpp) that the Tesla overlay reads through dmnt:cht.  The mod
+ * now opens ZERO fs service sessions for its entire lifetime, which is the
+ * v645 state that was proven safe -- but with logs covering every world,
+ * every menu and every applet switch.  See docs/RINGLOG_PLAN.md.
+ *
+ * kNoLog stays as the last-resort escape hatch: true compiles even the RAM
+ * ring writes out. */
+constexpr bool kNoLog = false;
+#define LOGF(...) do { if (!kNoLog) { ringlog::Append(__VA_ARGS__); } } while (0)
+/* Periodic chatter.  Costs the same to write but is refused whenever the log's
+ * token bucket is half spent, so heartbeats and pass counters cannot starve the
+ * event lines -- which is exactly what happened to the first SDLOG-5 run: 399
+ * of 400 lines were heartbeat and the cap ended the log after a minute. */
+#define LOGL(...) do { if (!kNoLog) { ringlog::Append(__VA_ARGS__); } } while (0)
+/* v634: for lines that are printed at most once per session.  LOGF goes through
+ * the token bucket (12 lines / 2 s), and a once-only line that is dropped is
+ * gone for good -- that is why nine minutes of v633 play produced not a single
+ * `bundle:` line even though the code had run.  These bypass the bucket. */
+#define LOGM(...) do { if (!kNoLog) { ringlog::Append(__VA_ARGS__); } } while (0)
+
+/* v636: one line per hook, the first time that hook runs while no world exists.
+ *
+ * The v635 log settled one thing: on the character-creation screen
+ * HookGameUpdate has stood down (gate: menu=1 world=0 keeps printing) and
+ * HookDrawHud is never called at all (not one `draw: hold` line), yet the
+ * console still freezes the moment the name box is tapped.  So whatever we do
+ * in that state, at least one other hook of ours is running there -- and
+ * guessing which one has already cost several builds.
+ *
+ * This prints the answer instead.  Every hook that could plausibly fire on
+ * that screen records its name once, and only while s_worldAlive is 0, so the
+ * log ends with the exact set of hooks that were live at the freeze. */
+#define HIT_NO_WORLD(tag)                                                     \
+    do {                                                                      \
+        static unsigned s_hit##tag = 0;                                       \
+        if (s_hit##tag == 0 && s_worldAlive == 0) {                           \
+            s_hit##tag = 1;                                                   \
+            LOGM("hit: " #tag);                                               \
+        }                                                                     \
+    } while (0)
 
 /* v281 DIAGNOSTIC: install no hooks at all.
  *
@@ -73,10 +144,66 @@ static const bool kDiagNoHooks = false;
  * magic bytes at the front, not by address -- see settime::Request. */
 __attribute__((used)) settime::Request g_timeRequest{"SDV-SETTIME-01", 0u, 600};
 
+/* Defined at the end of this file (the Mod-page row labels use it).  The map
+ * hover block lives inside the anonymous namespace below and needs it to build
+ * a newline for single-line tooltips (v556), so the declaration sits here, in
+ * the same scope as the definition -- declaring it inside the namespace would
+ * create a second, distinct function and every call would be ambiguous. */
+void* MakeFreshString(void* src, const char16_t* text, int len);
+
+/* v639: declared HERE, at global scope, for the same reason as MakeFreshString
+ * above -- the definition sits past the point where the anonymous namespace
+ * closes, and a declaration inside the namespace would name a second, distinct
+ * function (the compiler said so: "declared 'static' but never defined").
+ *
+ * Needed early because the world-map region code builds a page before any
+ * other caller and has to ask where the player is. */
+void* SafeCurrentLocation();
+
 namespace {
 
     /* Module base, filled in exl_main. */
     uintptr_t g_base = 0;
+
+    /* v616/v636: 1 while a world exists, written by HookGameUpdate every frame.
+     * Read by the draw gate and by the one-shot hook-hit log.  Defined up here
+     * because the log is used from hooks that appear very early in the file. */
+    unsigned s_worldAlive = 0;
+
+    /* v646: 600-frame fs warm-up, kept per-world.  v647: the channel never
+     * reopens, so g_logEpoch / the re-arm path are inert after the first
+     * Shutdown(); they are left in place so the cold-boot path is unchanged.
+     * The warm-up still matters: opening fs while the game mounts the save is
+     * SDLOG-1's hang. */
+    unsigned s_stFrame = 0;
+    unsigned g_logWarmup = 0;
+    unsigned g_logEpoch = 0;
+
+    /* v643: "returned to title" latch.
+     *
+     * Hardware fact (the user found it): creating a farmer from a COLD BOOT
+     * never freezes; enter a save -> return to title -> create a farmer always
+     * does.  The v641 log shows why: after leaving the save,
+     *   gate: leave world f=5184
+     *   gate: enter world f=5753     <- stale location still in the slot
+     *   gate: leave world f=5797
+     * Game1.currentLocation keeps the PREVIOUS save's GameLocation pointer for
+     * hundreds of frames.  SafeCurrentLocation() maps and reads it fine (a
+     * freed block stays mapped), so hasWorld flips back to true on the title
+     * / character-creation screen and the entire "world is running" body --
+     * HUD sampling, managed strings, cached sprite pointers from the dead save
+     * -- executes there.  That is the data abort (2162-0004).
+     * On a cold boot the slot is null, nothing runs, and it never freezes.
+     *
+     * So: once a world has gone away, treat the process as being on the title
+     * screen until a GENUINELY NEW world appears -- a location or player
+     * pointer different from the ones we recorded in the last save.  Until
+     * then GameWorldRunning() answers false without touching any game getter
+     * at all, which is exactly the cold-boot path that is known to be safe. */
+    unsigned g_titleMode = 0;
+    void*    g_lastWorldLoc = nullptr;
+    void*    g_lastWorldPl  = nullptr;
+
 
     /* SpriteBatch.Draw(Texture2D, Rectangle, Color) -- 0xC1A80.
      * Rectangle arrives by value in two 64-bit registers (x|y<<32, w|h<<32). */
@@ -425,58 +552,55 @@ namespace {
     /* HUD layout.  The icon is 32x32 art drawn at an integer scale so the
      * rectangles stay on whole pixels -- 1.5x would put every run on a half
      * pixel and the art would look blurred.  2x = 64x64. */
-    /* Layout.  Three rows on a fixed 72px pitch; each row is a 64px-tall band
-     * and its icon is centred both in the band and on x=56.  That is what
-     * makes the rows read evenly: v414 right-aligned the art, which lined the
-     * right edges up but left the 40px luck icon 24px further in than the
-     * 64px ones, and it looked shifted.
+    /* Layout: two columns, and the content flows into them.
      *
-     *   row 0 (weather) band 20..84   icon 64 tall -> y 20, centre 52
-     *   row 1 (luck)    band 92..156  icon 56 tall -> y 96, centre 124
-     *   row 2 (tool)    band 164..228 icon 64 tall -> y 164, centre 196
+     * Row 0 is always weather (left) and daily luck (right) -- those two have
+     * something to say every day.  Every row below exists only when it has
+     * content, and a missing row pulls the ones under it up one pitch, so the
+     * block never shows a gap above a filled row.  DrawHudInfo owns the order
+     * and the row-major fill.
      *
-     * Text sits at the band centre minus half a text line (12), and every row
-     * starts at x=96. */
+     * Icons are 64x64: kHudIconScale on our own 32x32 art, 4x on the game's
+     * 16x16 cells.  Text starts 72px into the cell (clear of the icon) and
+     * sits 20px down, which centres it on a 64px icon.
+     *
+     *   col 0 x=24  (icon centre 56)   col 1 x=264 (icon centre 296) */
     constexpr int kHudIconCx = 56;
-    constexpr int kHudBand = 64;
-    constexpr int kHudRowPitch = 72;
     constexpr int kHudRowY = 20;
     constexpr float kHudTextX = 96.0f;
 
     constexpr int kHudIconX = kHudIconCx - 32;      /* 24, art is 64 wide */
-    constexpr int kHudIconY = kHudRowY;             /* 20 */
     constexpr int kHudIconScale = 2;
-    constexpr float kHudTextY = kHudRowY + 20.0f;   /* 40 */
+    /* 80 is what row 0 -> row 1 has always used (20 -> 100). */
+    constexpr int kHudFlowPitch = 80;
+    /* Second column.  It was 264 when the birthday row moved out of its way
+     * whenever a tool was upgrading; now the birthday block stays put and the
+     * next item is allowed to fill the cell beside it, so the gap has to hold
+     * the longest text the left column can produce.  That is the gift hint:
+     * "最爱 " + two names + the separator, capped at 22 units by its builder
+     * (worst realistic case 16 characters x ~16px = 256px, ending at x=352).
+     * 368 leaves that a clear 16px before the right column's icon. */
+    constexpr int kHudCol1X = 368;
+    /* The diagnostic block starts below the whole list.  The tallest case is
+     * three left rows (weather, birthday, Queen of Sauce), which ends at
+     * y=244 (20 + 2*80 + 64), so 256 clears it with the 13 probe lines still
+     * fitting above the toolbar. */
+    constexpr float kHudDiagY = 256.0f;
 
-    /* Two columns, two rows.  A single stack of four rows reached y=300 and
-     * left the right half of the screen empty; 2x2 ends at y=164 and uses
-     * 600px of width instead.
-     *
-     *   col 0 x=24  (icon centre 56)   col 1 x=264 (icon centre 296)
-     *   row 0 y=20   weather           luck
-     *   row 1 y=100  birthday          tool upgrade
-     */
-    constexpr int kHudCol1X = 264;
-    constexpr int kHudRow1Y = 100;
+
 
     /* Daily luck.  The icon is Cursors (50,428,10,14) -- the exact region UI
      * Info Suite 2 uses for it -- drawn at 4x, also like the original.  It is
      * tinted by luck tier, so the colour alone tells you the answer. */
-    constexpr int kHudLuckX = kHudCol1X + 12;       /* 276, art is 40 wide */
-    constexpr int kHudLuckY = kHudRowY + (kHudBand - 56) / 2;   /* 24 */
     constexpr int kHudLuckScale = 4;
     /* Transparent rows under the die art, times the scale.  See the draw. */
     constexpr int kHudLuckArtDy = 12;
-    constexpr float kHudLuckTextY = kHudRowY + 20.0f;    /* 40 */
 
     /* Tool upgrade.  The icon is the tool's own sprite, taken from the game's
      * tool sheet -- that is what UI Info Suite 2 does, and what the player
      * expects (a copper axe while the axe is in the shop).  Our own hammer is
      * only the fallback for when the tool cannot be read. */
-    constexpr int kHudToolX = kHudIconX;            /* 24, art is 64 wide */
-    constexpr int kHudToolY = kHudRow1Y;            /* 100 */
     constexpr int kHudToolScale = 2;
-    constexpr float kHudToolTextY = kHudRow1Y + 20.0f;   /* 120 */
 
     /* Farmer.toolBeingUpgraded (NetRef<Tool>) -> Tool.indexOfMenuItemView
      * (NetInt) -> Game1.getSquareSourceRectForNonStandardTileSheet(sheet, 16,
@@ -537,6 +661,9 @@ namespace {
 
     /* Game1.get_locations(): List<GameLocation>, items at +0x10, size at +0x18. */
     constexpr uintptr_t kGetLocationsOff = SDV_OFF(kGetLocationsOff, 0x1440790);
+    /* v554: Game1.get_currentLocation (static, no args).  The same getter the
+     * automation code uses later in the file; the map hook needs it to work
+     * out which world-map region the page is showing. */
     using GetLocationsFn = void* (*)();
     using DrawMiniFn = void (*)(void* self, void* batch, float alpha);
     using GetPlayerFn = void* (*)(void*);
@@ -562,6 +689,34 @@ namespace {
      * Hooking it makes the game hand over the lists it walks, which is the only
      * way left to learn an offset without guessing at structure. */
     constexpr uintptr_t kGetItemOff = SDV_OFF(kGetItemOff, 0x5D3C8C);
+
+    /* ---- v619: is a menu up?  The cheapest possible read. ----
+     *
+     * kGame1MenuOff (0xC95C140) is declared far below, next to the automation
+     * section it was first needed for, but the three hottest hooks --
+     * GetItem here, GetPlayer, String.Equals -- are installed up here.  A plain
+     * read of the static slot is all this needs: the address sits inside the
+     * module's own static area, so it is mapped whenever g_base is set, and
+     * RangeReadable would add a page-table query to a path that runs hundreds
+     * of times per frame.  docs/offsets/meta_game1.json confirms
+     * 0xC95C140 = _activeClickableMenu.
+     *
+     * Why it matters: a menu pauses the world, and on the character-creation
+     * screen these hooks are the only thing of ours still touching the game --
+     * the v616 log shows no draw-hook line at all after the freeze, while the
+     * update hook kept printing.  Turning this module completely off (v617) is
+     * what stopped the freeze, so every hook that can fire with a menu up is
+     * now a suspect and gets the same stand-down rule. */
+    constexpr uintptr_t kMenuSlotEarly = 0xC95C140u;
+
+    bool MenuIsUp() {
+        if (g_base == 0) {
+            return false;
+        }
+        return *reinterpret_cast<void* const*>(g_base + kMenuSlotEarly) !=
+               nullptr;
+    }
+
     using GetItemFn = void* (*)(void* list, int index);
     GetItemFn s_origGetItem = nullptr;
     void* s_gotLists[8] = {nullptr, nullptr, nullptr, nullptr,
@@ -570,6 +725,10 @@ namespace {
     void* s_gotElem = nullptr;
 
     void* HookGetItem(void* list, int index) {
+        HIT_NO_WORLD(getitem);
+        if (MenuIsUp()) {
+            return s_origGetItem(list, index);
+        }
         void* r = s_origGetItem(list, index);
         s_gotElem = r;
         if (s_gotCount < 8 && list != nullptr) {
@@ -608,7 +767,8 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 522;
+    constexpr int kBuildNo = 658;
+
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -721,7 +881,11 @@ namespace {
      * away, the hook functions become unreferenced and -Werror=unused-function
      * fails the build.  (Same trap as kTractorActive.) */
     static const bool kGiftHint = true;
-    constexpr int kRowCount = 15;
+    /* v656: 17 rows.  The 13 minecart rows (16..28) are gone -- the vanilla
+     * MineElevatorMenu-style cart menu now carries every destination, see
+     * Data/Minecarts in romfs.  Keeping a second copy on this page was the
+     * v546 placeholder and nothing else. */
+    constexpr int kRowCount = 17;
     constexpr int kRowMap = 1;
     constexpr int kRowMaster = 2;
     constexpr int kRowFirstSub = 3;
@@ -755,6 +919,27 @@ namespace {
      * gift rows, one bit higher in both carriers (preferences bit 15,
      * disconnectDay bit 26) so a save written by an earlier build reads as on. */
     constexpr int kRowCrop = 14;
+    /* v656: 献祭物品提示 on/off -- the HUD bundle hint row (v629: "is the item
+     * in my hand still wanted by a bundle").  Same "set = OFF" encoding as the
+     * HUD / gift / crop rows, one bit higher in disconnectDay (bit 28, the
+     * first free bit of byte 3 -- the keep ratio's nibble is at bits 12..15
+     * despite the stale comment below).  A save written by an earlier build
+     * has the bit clear, so updating reads as on.
+     *
+     * It does NOT ride the 16-bit preferences mask: bits 0..15 of that int are
+     * all taken (0 anim, 1..11 rows, 12 HUD, 13 gift, 14 tag, 15 crop), and
+     * the keep ratio already set the precedent of riding the farm save alone. */
+    constexpr int kRowBundle = 15;
+    /* v524: the auto-box keep ratio.  ONE row, and it behaves like a button:
+     * the checkbox is held checked and a click on it is read as "advance one
+     * step" (0 -> 25 -> 50 -> 75 -> 100 -> 0).  The percentage is drawn into the
+     * row's own label, so nothing else has to show it.
+     *
+     * The value rides in the disconnectDay nibble (bits 12..15), not in the
+     * 16-bit switch mask -- every bit of that one is taken. */
+    /* v526: the name is 自动售卖箱 (auto sell box) and the marker chest is a
+     * WHITE painted one -- see IsSellBox. */
+    constexpr int kRowKeep = 16;
     /* v314: THE WHOLE BITMAP LIVES IN ONE INT FIELD.
      *
      * Borrowing one bool per switch is what broke v312: two of the ten were
@@ -823,6 +1008,17 @@ namespace {
     /* v390: disconnectDay mask read throttle. */
     static unsigned s_discFrame = 0;
     static unsigned s_discDirty = 0;    /* a switch changed; write it next Update */
+    /* v536: the sell-box trimmer.  Declared up here because both the
+     * disconnectDay read/write below and the trim itself need them. */
+    static unsigned s_trimSweep    = 0;  /* this pass treats contents as new */
+    static unsigned s_trimCleared  = 0;  /* the save says the first sweep ran */
+    static unsigned s_trimSwept    = 0;  /* this session already swept */
+    static unsigned s_trimSweepReq = 0;  /* the ratio row was clicked */
+    static int      s_trimDbgId    = 0;  /* last item handled */
+    static int      s_trimDbgN     = 0;  /* its stack size */
+    static int      s_trimDbgSell  = 0;  /* how much of it was sold */
+    static unsigned s_trimDbgCrf   = 0;  /* clone failures this pass */
+    static unsigned s_trimDbgCat   = 0;  /* equipment skipped this pass */
     /* The value to inject into the SERIALISED copy at save time: the live
      * Options is not the object the serializer reads. */
     static unsigned g_savedMask = kMaskTag | kMaskBits;
@@ -874,7 +1070,7 @@ namespace {
     static unsigned s_applyDiffer = 0;  /* rows that differed at the last read */
     static unsigned s_applyBefore = 0;  /* g_rowOn[1..11] as a mask, pre-apply */
     static unsigned char s_rowPrev[kRowCount] =
-        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     static unsigned s_rowPrevInit = 0;
     static unsigned s_rowsApplied = 0;
     static void* g_ourElems[kRowCount] = {};
@@ -911,7 +1107,7 @@ namespace {
     /* Per-row state, read straight out of +0x51 each frame.  Rows 1..10 are
      * seeded from the file at boot; row 0 is the game's own option. */
     static unsigned g_rowOn[kRowCount] =
-        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     static void* g_ourElem = nullptr;   /* row 0, the HUD readout reads this */
     /* Mirror of g_rowOn[kRowMaster], used by every tractor hook. */
     static unsigned g_tractorOn = 1;
@@ -932,6 +1128,17 @@ namespace {
     static unsigned s_discGift = 1;
     /* And for the crop label, out of bit 15. */
     static unsigned s_discCrop = 1;
+    /* v656: and for the bundle hint, out of disconnectDay bit 28. */
+    static unsigned s_discBundle = 1;
+    /* v524: auto-box keep ratio, in percent (0 / 25 / 50 / 75 / 100).  0 keeps
+     * the v523 behaviour -- the black box is drained into the bin list every
+     * pass.  Above 0 it becomes a store: that share of machine output stays in
+     * the box and the rest is sold the moment it is collected. */
+    /* v533: 100 % until the player says otherwise.  A white box must never be
+     * drained just because a session started: "keep everything" is the only
+     * default that cannot destroy items. */
+    static unsigned s_keepPct = 0;
+    static unsigned s_keepRelabel = 0;   /* draw hook: label needs rebuilding */
     /* v469: and for the animation row, out of bit 0 (bit 27 of disconnectDay).
      * Separate from g_rowOn[0] on purpose: g_rowOn[0] tracks the LIVE option
      * byte (the checkbox), this is what the file said. */
@@ -2320,8 +2527,17 @@ namespace {
     static unsigned s_bushResetFail = 0;
     /* v343: file-store open attempts, drawn on the readout (rows 16/17). */
     static unsigned s_logTry = 0;
-    static unsigned s_logFrame = 0;
     static unsigned s_dbgRegChests = 0;
+    /* v529: DIAGNOSTIC (temporary).  The two colour fields of the registered
+     * chest nearest to the player, sampled once per automation pass and shown in
+     * the on-screen hex readout.  Stand next to the painted chest and compare:
+     *   row 3 = Chest.tint          (default Color.White = FFFFFFFF)
+     *   row 4 = Chest.playerChoiceColor (default Color.Transparent = 00000000)
+     * The palette's white swatch is FEFEFEFE; anything else means the picker
+     * stores something we have not accounted for. */
+    static unsigned s_dbgChestTint = 0;
+    static unsigned s_dbgChestPick = 0;
+    static unsigned s_dbgSellCount = 0;   /* IsSellBox() hits this pass */
     static unsigned s_dbgRegMachines = 0;
     static unsigned s_dbgGrpChests = 0;
     static unsigned s_dbgGrpMachines = 0;
@@ -2553,6 +2769,10 @@ namespace {
     constexpr uintptr_t kSpeedConstWord1Off = SDV_OFF(kSpeedConstWord1Off, 0x13DA0C0u);
 
     void* HookGetPlayer(void* a0) {
+        HIT_NO_WORLD(getplayer);
+        if (MenuIsUp()) {
+            return s_origGetPlayer(a0);
+        }
         void* player = s_origGetPlayer(a0);
         s_hits++;
         if (s_hits <= 3) {
@@ -2590,6 +2810,7 @@ namespace {
     PixelFn s_origPixel = nullptr;
 
     Vec2 HookPixel(void* pos, void* loc, u64 tile) {
+        HIT_NO_WORLD(pixel);
         Vec2 r = s_origPixel(pos, loc, tile);
 
         const int tx = static_cast<int>(static_cast<u32>(tile));
@@ -2651,8 +2872,11 @@ namespace {
     static const bool kDiagNoFix  = false;   /* skip FixTractorSprite */
 
     void HookDrawPortrait(void* who, int index, float x, float y) {
+        HIT_NO_WORLD(portrait);
         s_origDrawPortrait(who, index, x, y);
-        if (kDiagNoDraw) {
+        /* v637: s_mapPage is read right below with no readability check, and it
+         * can be left pointing at a destroyed maps page. */
+        if (s_worldAlive == 0 || kDiagNoDraw) {
             return;
         }
 
@@ -2974,6 +3198,22 @@ namespace {
             }
         }
         return true;
+    }
+
+    /* v557: can `slots` pointers really fit in a game list's element buffer?
+     *
+     * Every list write in this file used to trust `Plausible(buf)` alone, and
+     * that only proves the page holding the pointer is mapped.  A size field
+     * that is one too large, or a wrapper whose capacity pointer drifted, and
+     * the store lands in whatever follows the array -- which is exactly how a
+     * mod corrupts the heap and freezes a console instead of crashing.
+     * RangeReadable is the same check readVerifiedList has always done; this
+     * gives the write paths the same floor. */
+    bool ListRangeOk(const void* buf, int slots) {
+        if (buf == nullptr || slots < 1 || slots > 4097) {
+            return false;
+        }
+        return RangeReadable(buf, static_cast<size_t>(slots) * sizeof(void*));
     }
 
     /* ---- walk-sheet discovery -------------------------------------------
@@ -3301,6 +3541,20 @@ namespace {
     }
 
     void HookDrawMiniPortraits(void* self, void* batch, float alpha) {
+        HIT_NO_WORLD(miniport);
+        /* v637: every branch below reads state that only exists in a world --
+         * the hovered location, its NPC list, the tooltip table.  On the frame
+         * the save is closed this hook still runs once (the log showed
+         * `hit: miniport` there), and s_mapPage was left pointing at the page
+         * that had just been destroyed. */
+        if (s_worldAlive == 0) {
+            s_mapPage = nullptr;
+            if (s_origDrawMini != nullptr) {
+                s_origDrawMini(self, batch, alpha);
+            }
+            /* v640: the matching "<" for "> miniport".  A ">" with no "<" in
+             * the log means the console died inside this call. */return;
+        }
         s_mapDraws++;
         s_frame++;
         s_mapPage = self;
@@ -3661,13 +3915,28 @@ namespace {
                         /* Exact match first, then the first segment. */
                         for (int li = 0; li < locCount; li++) {
                             void* l = locs[li];
-                            if (l == nullptr || !Plausible(l)) {
+                            /* v558: `locs` comes from `get_locations()+0x10`,
+                             * which is the List's ARRAY object, not its data
+                             * (see RelabelSkullElevatorMenu for the layout).
+                             * This block therefore never matches a real
+                             * location -- which is why the shipped hover list
+                             * is the tooltip append further down, not this
+                             * floating name column.  The reads are bounded
+                             * here so a garbage element cannot fault. */
+                            if (l == nullptr || !Plausible(l) ||
+                                !RangeReadable(
+                                    reinterpret_cast<unsigned char*>(l) +
+                                        kLocNameOff,
+                                    8u)) {
                                 continue;
                             }
                             void* nw = *reinterpret_cast<void**>(
                                 reinterpret_cast<unsigned char*>(l) +
                                 kLocNameOff);
-                            if (nw == nullptr || !Plausible(nw)) {
+                            if (nw == nullptr || !Plausible(nw) ||
+                                !RangeReadable(
+                                    reinterpret_cast<unsigned char*>(nw) + 0x68,
+                                    8u)) {
                                 continue;
                             }
                             void* ns = *reinterpret_cast<void**>(
@@ -4056,6 +4325,173 @@ namespace {
                 int locationCount = 0;
                 unsigned seen = 0, drawn = 0, withSheet = 0, noSheet = 0;
                 unsigned matched = 0, fallback = 0, badTile = 0;
+
+                /* v554: which world-map region the page is drawing.
+                 *
+                 * Data/WorldMap holds two regions, "Valley" and
+                 * "GingerIsland", and the map page draws exactly one of them.
+                 * MapPage.ctor does
+                 *
+                 *     mapPosition = GetPositionData(currentLocation, tile)
+                 *                   ?? GetPositionData(farm, Point.Zero);
+                 *     mapRegion   = mapPosition?.Data.Region
+                 *                   ?? GetMapRegions().First();   // Valley
+                 *
+                 * and vanilla drawMiniPortraits then drops every farmer whose
+                 * position resolves into another region.  This pass had no
+                 * such filter: it walked every location in Game1.locations and
+                 * placed each villager with the Valley rectangles, so while the
+                 * ginger-island page was up every Pelican Town villager was
+                 * painted onto the island map.  (The island locations were not
+                 * in the table at all and all fell back to the Farm's centre.)
+                 *
+                 * GetPositionData is a managed call and this is the draw hook,
+                 * so the region is read off the page itself instead.  The two
+                 * readings below are tried in this order:
+                 *
+                 *   1. the page's own MapArea list.  Every tooltip id is
+                 *      "{areaId}/{tooltipId}" and the two regions have
+                 *      disjoint area ids -- Valley: Backwoods, Beach,
+                 *      BeachNightMarket, BusStop, Desert, Farm, Forest,
+                 *      Mountain, Railroad, SecretWoods, Town, GingerIsland;
+                 *      Island: East, North, South, SouthEast, West.  The page
+                 *      only holds the areas of the region it draws, so one
+                 *      readable id answers the question -- including while the
+                 *      player stands inside a shed or greenhouse on the island
+                 *      farm, where the location itself has no Data/WorldMap
+                 *      position and vanilla walks up to the parent building.
+                 *
+                 *   2. the name of the location the player is in, looked up in
+                 *      the table.  This is MapPage.ctor's own fallback rule: a
+                 *      location with no position makes the page fall back to
+                 *      the Farm, i.e. Valley.  Only used when no tooltip id can
+                 *      be read at all. */
+                int mapRegion = -1;
+                {
+                    /* -1 = not a readable area id, 0 = valley area,
+                     * 1 = island area.  Only the first segment of
+                     * "{areaId}/{tooltipId}" is compared. */
+                    auto areaIdRegion = [&](void* str) -> int {
+                        if (!Plausible(str) || !readableRange(str, 0x18u)) {
+                            return -1;
+                        }
+                        const auto* b =
+                            reinterpret_cast<const unsigned char*>(str);
+                        const int len = *reinterpret_cast<const int*>(b + 0x10);
+                        if (len <= 0 || len > 64 ||
+                            !readableRange(b + 0x14,
+                                           static_cast<size_t>(len) * 2u)) {
+                            return -1;
+                        }
+                        const char16_t* s =
+                            reinterpret_cast<const char16_t*>(b + 0x14);
+                        int seg = 0;
+                        for (; seg < len && s[seg] != u'/'; seg++) {
+                            /* keep the length; compare below */
+                        }
+                        static const char* kIslandAreas[] = {
+                            "East", "North", "South", "SouthEast", "West"};
+                        for (int k = 0; k < 5; k++) {
+                            const char* a = kIslandAreas[k];
+                            int m = 0;
+                            while (m < seg && a[m] != '\0' &&
+                                   s[m] == static_cast<unsigned char>(a[m])) {
+                                m++;
+                            }
+                            if (m == seg && a[m] == '\0') {
+                                return kMapRegionIsland;
+                            }
+                        }
+                        return kMapRegionValley;
+                    };
+                    void* areas = *reinterpret_cast<void**>(
+                        reinterpret_cast<unsigned char*>(self) + kMapAreasOff);
+                    if (Plausible(areas) && readableRange(areas, 0x28u)) {
+                        void** areaItems = *reinterpret_cast<void***>(
+                            reinterpret_cast<unsigned char*>(areas) + 0x10);
+                        void* areaLen = *reinterpret_cast<void**>(
+                            reinterpret_cast<unsigned char*>(areas) + 0x20);
+                        int ac = 0;
+                        if (readableRange(areaLen, 4u)) {
+                            ac = *reinterpret_cast<const int*>(areaLen);
+                        }
+                        if (ac > 0 && ac <= 64 && Plausible(areaItems) &&
+                            readableRange(areaItems,
+                                          static_cast<size_t>(ac) *
+                                              sizeof(void*))) {
+                            for (int ai = 0; ai < ac && mapRegion < 0; ai++) {
+                                void* area = areaItems[ai];
+                                if (!Plausible(area) ||
+                                    !readableRange(area, 0x20u)) {
+                                    continue;
+                                }
+                                void* tips = *reinterpret_cast<void**>(
+                                    reinterpret_cast<unsigned char*>(area) +
+                                    kMapAreaTooltipsOff);
+                                if (!Plausible(tips) ||
+                                    !readableRange(tips, 0x28u)) {
+                                    continue;
+                                }
+                                void** tipItems = *reinterpret_cast<void***>(
+                                    reinterpret_cast<unsigned char*>(tips) +
+                                    0x10);
+                                void* tipLen = *reinterpret_cast<void**>(
+                                    reinterpret_cast<unsigned char*>(tips) +
+                                    0x20);
+                                int tc = 0;
+                                if (readableRange(tipLen, 4u)) {
+                                    tc = *reinterpret_cast<const int*>(tipLen);
+                                }
+                                if (tc <= 0 || tc > 256 ||
+                                    !Plausible(tipItems) ||
+                                    !readableRange(tipItems,
+                                                   static_cast<size_t>(tc) *
+                                                       sizeof(void*))) {
+                                    continue;
+                                }
+                                for (int ti = 0; ti < tc && mapRegion < 0;
+                                     ti++) {
+                                    void* tip = tipItems[ti];
+                                    if (!Plausible(tip) ||
+                                        !readableRange(tip, 0x48u)) {
+                                        continue;
+                                    }
+                                    mapRegion = areaIdRegion(
+                                        *reinterpret_cast<void**>(
+                                            reinterpret_cast<unsigned char*>(
+                                                tip) +
+                                            kMapTooltipIdOff));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (mapRegion < 0) {
+                    mapRegion = kMapRegionValley;
+                    /* v639: was the raw 0x14407B0 through a local alias. */
+                    void* here = SafeCurrentLocation();
+                    void* hereName = nullptr;
+                    if (Plausible(here) && readableRange(here, 0xB8u)) {
+                        void* netName = *reinterpret_cast<void**>(
+                            reinterpret_cast<unsigned char*>(here) + 0x1A8);
+                        if (Plausible(netName) &&
+                            readableRange(netName, 0x70u)) {
+                            void* inner = *reinterpret_cast<void**>(
+                                reinterpret_cast<unsigned char*>(netName) +
+                                0x68);
+                            if (Plausible(inner)) {
+                                hereName = inner;
+                            }
+                        }
+                    }
+                    for (int k = 0; k < kWorldMapCount && hereName != nullptr;
+                         k++) {
+                        if (NameEquals(hereName, kWorldMap[k].name)) {
+                            mapRegion = kWorldMap[k].region;
+                            break;
+                        }
+                    }
+                }
 
                 /* One entry per avatar to draw.  Collected in the walk below,
                  * spread apart, then drawn -- see the second pass after the
@@ -5569,6 +6005,16 @@ namespace {
                             matched++;
                         }
 
+                        /* v554: draw only the region that is on screen.
+                         * Vanilla's drawMiniPortraits has the same test
+                         * (`Data.Region.Id != mapRegion.Id`), and a location
+                         * without a position in Data/WorldMap -- the Farm
+                         * fallback above -- is never placed on the island map
+                         * either, so it is dropped there with the rest. */
+                        if (entry->region != mapRegion) {
+                            continue;
+                        }
+
                         const float rx = static_cast<float>(entry->rectX) * 4.0f;
                         const float ry = static_cast<float>(entry->rectY) * 4.0f;
                         const float rw = static_cast<float>(entry->rectW) * 4.0f;
@@ -5578,6 +6024,14 @@ namespace {
                         if (rw < 1.0f || rh < 1.0f || mw < 1.0f || mh < 1.0f) {
                             continue;
                         }
+                        /* A 1x1 rect is a fixed map position: vanilla takes
+                         * the centre of the pixel area and ignores the tile
+                         * (MapAreaPosition.IsFixedMapPosition).  The tile
+                         * interpolation would land within the same 4x4 pixel,
+                         * but the centre is what the game draws the player
+                         * marker on, so the head sits on the marker. */
+                        const bool fixedPos = entry->rectW <= 1 &&
+                            entry->rectH <= 1;
 
                         for (int j = 0; j < n && drawn < 256; j++) {
                             void* npc = npcs[j];
@@ -5693,10 +6147,10 @@ namespace {
                                 }
                             }
 
-                            const float px = useCenter
+                            const float px = (useCenter || fixedPos)
                                 ? rx + rw * 0.5f
                                 : rx + rw * (static_cast<float>(tx) / mw);
-                            const float py = useCenter
+                            const float py = (useCenter || fixedPos)
                                 ? ry + rh * 0.5f
                                 : ry + rh * (static_cast<float>(ty) / mh);
                             const int mx = static_cast<int>(
@@ -6278,9 +6732,10 @@ namespace {
                      *       FEFFFEFF = untouched default (nothing of ours)
                      *       5A5A0xxx = our magic | switch mask (write stuck)
                      *       FFFFFFFF = player/wrapper not readable */
-                    shown[3] = ((s_dbgLoadRuns & 0xFu) << 16) |
-                        ((s_dbgHookRuns & 0xFu) << 12) | (s_dbgCoVal & 0xFFFu);
-                    shown[4] = s_dbgDisc;
+                    /* v529 DIAG (temporary): nearest chest's chest.tint and
+                     * chest.playerChoiceColor.  */
+                    shown[3] = s_dbgChestTint;
+                    shown[4] = s_dbgChestPick;
                     for (int i = 0; i < 5; i++) {
                         hexnum(bounds[0] + 96, bounds[1] + 100 + i * 34,
                                static_cast<unsigned>(i), 1, 4);
@@ -6588,6 +7043,10 @@ namespace {
                  * with Substring and the names concatenated on, with no
                  * string allocator involved.
                  *
+                 * v556: that only holds for tooltips that carry a second line.
+                 * All Ginger Island tooltips are one line, so no newline
+                 * exists to cut; see the merge below, which builds one.
+                 *
                  *   Substring 0x395F40  (this, startIndex, length)  -- 270 live callers
                  *   Concat    0x39D7C0  (a, b)                      -- 2019 live callers
                  *
@@ -6693,8 +7152,7 @@ namespace {
 
                 int inRect = 0;
                 int appended = 0;
-                if (readable && nlIdx >= 0 && rectOk != 0 &&
-                    ht != s_lastAppendSrc) {
+                if (readable && rectOk != 0 && ht != s_lastAppendSrc) {
                     /* Same space the markers live in: bounds + 4*texture. */
                     const float rx0 = static_cast<float>(bounds[0]) +
                                       static_cast<float>(tipX) * 4.0f +
@@ -6708,7 +7166,22 @@ namespace {
                         g_base + 0x395F40);
                     auto concat = reinterpret_cast<void* (*)(void*, void*)>(
                         g_base + 0x39D7C0);
-                    void* nl = substring(ht, nlIdx, 1);
+                    /* The newline that separates the tooltip from the names.
+                     *
+                     * v141..v555 cut it out of hoverText itself, which only
+                     * works when the tooltip already has a second line (the
+                     * opening hours most mainland buildings carry).  Every
+                     * Ginger Island tooltip is a single line -- "Jungle Hut",
+                     * "Birdie's Shack", "Qi's Walnut Room" -- so the island map
+                     * never showed an NPC list at all.  Same hole for the
+                     * mainland one-liners (Elliott's cabin, the backwoods...).
+                     * v556 builds the one-character "\n" instead:
+                     * MakeFreshString pads a source and slices it, so the
+                     * result is a fresh string that is safe to hand to the
+                     * game's text renderer. */
+                    void* nl = (nlIdx >= 0)
+                                   ? substring(ht, nlIdx, 1)
+                                   : MakeFreshString(ht, u"\n", 1);
                     if (nl != nullptr && Plausible(nl)) {
                         void* merged = ht;
                         for (int k = 0; k < s_avCount && appended < 4; k++) {
@@ -9326,17 +9799,14 @@ namespace {
             return;
         }
 
-        /* Stage 14: print the three mount Result codes in hex, top to bottom:
-         *   fsInitialize / fsOpenSdCardFileSystem / fsFsCreateFile
-         * 00000000 means that step succeeded. */
-        if (kMapStage == 14) {
-            const int cell = 4;
-            hexnum(bounds[0] + 120, bounds[1] + 150, sdlog::DiagSm(), 8, cell);
-            hexnum(bounds[0] + 120, bounds[1] + 180, sdlog::DiagInit(), 8, cell);
-            hexnum(bounds[0] + 120, bounds[1] + 210, sdlog::DiagOpenFs(), 8, cell);
-            hexnum(bounds[0] + 120, bounds[1] + 240, sdlog::DiagCreate(), 8, cell);
-            return;
-        }
+        /* Stage 14 is gone.  It drew the mount/diagnostic result codes only
+         * when kMapStage == 14, and kMapStage is 327, so the whole block was
+         * constant-folded away -- main.o referenced no sdlog::Diag* symbol at
+         * all, which means those rows were never drawn in any SDLOG build and
+         * every "read stage 14" instruction was asking for something invisible.
+         * sdlog now reports through marker files on the SD card instead:
+         * fsFsCreateFile is the one operation hardware has proven works, and a
+         * directory listing survives a failed write and a hang alike. */
 
         /* Stage 13: the character stage, same bit-grid readout.
          *   row 0 (y+150) = characters returned by List.get_Item
@@ -10475,6 +10945,7 @@ namespace {
     void TryPerformSave();
 
     bool HookCheckSingleAnimation(void* self, void* who) {
+        HIT_NO_WORLD(anim);
         const bool result = s_origCheckSingle(self, who);
         if (kDiagNoAnim) {
             return result;
@@ -10541,6 +11012,8 @@ namespace {
      * Still no re-entry, still nothing managed, still leaves safetyTimer and
      * the close sequence alone. */
     void HookDialogueUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(dialogueupdate);
         s_origDialogueUpdate(self, gameTime);
         if (g_animFast <= 1 || self == nullptr || !Plausible(self) ||
             !RangeReadable(self, 0xD0u)) {
@@ -10744,6 +11217,8 @@ namespace {
     }
 
     void HookBusUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(busupdate);
         const bool track = (g_animFast > 1) && self != nullptr &&
             Plausible(self) && RangeReadable(self, 0x340u);
         s_origBusUpdate(self, gameTime);
@@ -10765,6 +11240,8 @@ namespace {
      * is no forceWarpTimer here: `Desert` has no such field, the warp is
      * driven by busLeftToValley instead, so only the motion needs work. */
     void HookDesertUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(desertupdate);
         const bool track = (g_animFast > 1) && self != nullptr &&
             Plausible(self) && RangeReadable(self, 0x340u);
         s_origDesertUpdate(self, gameTime);
@@ -10785,6 +11262,7 @@ namespace {
      * This exists so SyncFastFromOptions can call savePreferences on the same
      * object the boot path uses.  See the comment there for why. */
     void HookLoadPreferences(void* self, int a, int b, int c) {
+        HIT_NO_WORLD(loadprefs);
         if (s_dbgLoadRuns < 0xFu) {
             ++s_dbgLoadRuns;      /* v387: proves hooks fire at all */
         }
@@ -10814,6 +11292,8 @@ namespace {
      * These run on a thread-pool thread (savePreferences wraps the write in
      * new Task(...) + Start), so nothing here may allocate or block. */
     void HookSavePreferencesImpl(void* self) {
+
+        HIT_NO_WORLD(savepreferencesimpl);
         if (s_wrEntered < 15u) {
             s_wrEntered++;
         }
@@ -10825,6 +11305,8 @@ namespace {
     }
 
     void HookWriteSettings(void* self, void* writer) {
+
+        HIT_NO_WORLD(writesettings);
         if (s_wrWrite < 15u) {
             s_wrWrite++;
         }
@@ -10879,7 +11361,7 @@ namespace {
         void* buf = *reinterpret_cast<void**>(
             reinterpret_cast<unsigned char*>(wrapper) + 0x10);
         if (capPtr == nullptr || buf == nullptr || !RangeReadable(capPtr, 4u) ||
-            !Plausible(buf)) {
+            !ListRangeOk(buf, cnt + 1)) {
             return false;
         }
         if (*reinterpret_cast<int*>(capPtr) <= cnt) {
@@ -10898,7 +11380,7 @@ namespace {
             }
             buf = *reinterpret_cast<void**>(
                 reinterpret_cast<unsigned char*>(wrapper) + 0x10);
-            if (buf == nullptr || !Plausible(buf)) {
+            if (!ListRangeOk(buf, cnt + 1)) {
                 return false;
             }
             /* v376 SAFETY: v375 wrote without re-checking the capacity, so if
@@ -10974,6 +11456,83 @@ namespace {
             p[i] = text[i];
         }
         return out;
+    }
+
+    /* ---- v524/v537: the auto sell box row -------------------------------
+     *
+     * Two jobs, both pure text: build the ten characters of the row label from
+     * a percentage, and write a freshly built label into a row element.
+     *
+     * v537: the label now says WHAT the number is, because "50 %" alone does
+     * not tell anyone whether it means "keep half" or "sell half".  The row
+     * reads, in exactly 10 cells:
+     *
+     *     自动售卖箱 不卖         0 %   -- nothing is sold
+     *     自动售卖箱 卖25%        25 %  -- a quarter of what arrives is sold
+     *     自动售卖箱 卖50%        50 %
+     *     自动售卖箱 卖75%        75 %
+     *     自动售卖箱 全卖         100 % -- everything that arrives is sold
+     *
+     * The length is fixed at 10 because MakeFreshString rebuilds a string by
+     * padding its SOURCE to `len` and then taking a substring of that length.
+     * A source of exactly `len` characters would come back as itself and the
+     * helper refuses it, so RenderKeepLabel deliberately borrows ANOTHER row's
+     * label (4 chars, alive because the page owns it) as the source.
+     */
+    void BuildKeepText(char16_t* out, unsigned pct) {
+        /* 5 cells for the name, 1 space, then 4 cells of state. */
+        static const char16_t kName[5] = {
+            u'\u81EA', u'\u52A8', u'\u552E', u'\u5356', u'\u7BB1'};
+        for (int i = 0; i < 5; ++i) {
+            out[i] = kName[i];
+        }
+        out[5] = u' ';
+        const unsigned v = pct > 100u ? 100u : pct;
+        if (v == 0u) {
+            out[6] = u'\u4E0D';                      /* 不 */
+            out[7] = u'\u5356';                      /* 卖 */
+            out[8] = u' ';
+            out[9] = u' ';
+            return;
+        }
+        if (v >= 100u) {
+            out[6] = u'\u5168';                      /* 全 */
+            out[7] = u'\u5356';                      /* 卖 */
+            out[8] = u' ';
+            out[9] = u' ';
+            return;
+        }
+        out[6] = u'\u5356';                          /* 卖 */
+        out[9] = u'%';
+        if (v >= 10u) {
+            out[7] = static_cast<char16_t>(u'0' + (v / 10u));
+            out[8] = static_cast<char16_t>(u'0' + (v % 10u));
+        }
+        else {
+            out[7] = u' ';
+            out[8] = static_cast<char16_t>(u'0' + v);
+        }
+    }
+
+    void RenderKeepLabel(void* el) {
+        void* srcEl = g_ourElems[kRowMap];
+        if (el == nullptr || srcEl == nullptr || !Plausible(el) ||
+            !Plausible(srcEl) ||
+            !RangeReadable(reinterpret_cast<unsigned char*>(srcEl) + 0x20, 8u) ||
+            !RangeReadable(reinterpret_cast<unsigned char*>(el) + 0x20, 8u)) {
+            return;
+        }
+        void* srcLabel = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(srcEl) + 0x20);
+        char16_t text[10];
+        BuildKeepText(text, s_keepPct);
+        void* lbl = MakeFreshString(srcLabel, text, 10);
+        if (lbl == nullptr) {
+            return;
+        }
+        /* Created and stored with no allocation in between (same rule as the
+         * v216 label path). */
+        *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(el) + 0x20) = lbl;
     }
 
     /* v232: which tab's icon we want, and how our own name is built.
@@ -11493,9 +12052,11 @@ namespace {
                         u"\u5DE6\u4E0A\u89D2\u4FE1\u606F",        /* 左上角信息  */
                         u"\u793C\u7269\u53E3\u5473\u63D0\u793A",        /* 礼物口味提示 */
                         u"\u4F5C\u7269/\u673A\u5668\u63D0\u793A",      /* 作物/机器提示 */
+                        u"\u732E\u796D\u7269\u54C1\u63D0\u793A",      /* 献祭物品提示 (v656) */
+                        u"\u81EA\u52A8\u552E\u5356\u7BB1 \u4E0D\u5356  ",  /* 自动售卖箱 不卖 */
                     };
                     static const int kRowLen[kRowCount] =
-                        {6, 4, 5, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5, 6, 7};
+                        {6, 4, 5, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5, 6, 7, 6, 10};
                     /* Row 0 keeps the game's own `which` (35 -> +0x24), so the
                      * animation flag keeps working exactly as it always has.
                      * Every other row gets the sentinel: the click writes
@@ -11505,7 +12066,7 @@ namespace {
                         35, kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                         kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                         kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
-                        kOptIndex2, kOptIndex2,
+                        kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                     };
                     if (s_rowsApplied == 0) {
                         if (s_fileMaskOk != 0) {
@@ -11528,6 +12089,9 @@ namespace {
                             g_giftOn = s_discGift;
                             g_rowOn[kRowCrop] = s_discCrop;
                             g_cropOn = s_discCrop;
+                            /* v656: the bundle row does not ride the mask
+                             * bits; it comes from disconnectDay bit 28. */
+                            g_rowOn[kRowBundle] = s_discBundle;
                         }
                         s_rowsApplied = 1;
                     }
@@ -11553,8 +12117,15 @@ namespace {
                             !AppendToList(pageOpts, el)) {
                             break;              /* no capacity: stop cleanly */
                         }
-                        void* lbl = MakeFreshString(srcName, kRowText[i],
-                                                    kRowLen[i]);
+                        char16_t keepText[10];
+                        const char16_t* rowText = kRowText[i];
+                        int rowLen = kRowLen[i];
+                        if (i == kRowKeep) {
+                            BuildKeepText(keepText, s_keepPct);
+                            rowText = keepText;
+                            rowLen = 10;
+                        }
+                        void* lbl = MakeFreshString(srcName, rowText, rowLen);
                         if (lbl == nullptr) {
                             /* Undo this one append and stop. */
                             *reinterpret_cast<int*>(
@@ -11573,8 +12144,7 @@ namespace {
                         if (i != 0) {
                             *reinterpret_cast<unsigned char*>(
                                 reinterpret_cast<unsigned char*>(el) + 0x51) =
-                                static_cast<unsigned char>(
-                                    g_rowOn[i] != 0 ? 1 : 0);
+                                static_cast<unsigned char>(g_rowOn[i] != 0 ? 1 : 0);
                         }
                         g_ourElems[i] = el;
                         made++;
@@ -11919,6 +12489,15 @@ namespace {
         order[n++] = kRowGift;
         /* v453: and a fourth.  Any row missing here is silently dropped. */
         order[n++] = kRowCrop;
+        /* v656: the bundle hint row, one slot above the sell-box ratio row
+         * (the user asked for it right there).  Same "missing here = dropped"
+         * trap as the four above. */
+        order[n++] = kRowBundle;
+        /* v525: and a fifth -- v524 appended the ratio row and this list cut it
+         * straight back out, which is why the mod page never showed it.  It is
+         * placed right after the automation switch so it sits next to the
+         * feature it belongs to. */
+        order[n++] = kRowKeep;
         return n;
     }
 
@@ -12231,6 +12810,8 @@ namespace {
     }
 
     void HookGameMenuUpdate(void* self, void* time) {
+
+        HIT_NO_WORLD(gamemenuupdate);
         /* v318 diagnostics: one cheap read per menu frame. */
         g_dbgPages = -1;
         g_dbgPageIdx = -2;
@@ -12295,6 +12876,8 @@ namespace {
      * is why the name only has to be *a* unique managed string -- it never has
      * to be compared by content. */
     int HookTabNumFromName(void* self, void* name) {
+
+        HIT_NO_WORLD(tabnumfromname);
         /* v231: our tab carries a BORROWED name (a copy of one of the game's
          * own tab names) so the icon lookup finds an icon for it.  The game's
          * own getTabNumberFromName dispatches by string IDENTITY, so it would
@@ -12357,6 +12940,8 @@ namespace {
     }
 
     void* HookTabLabelFromIdx(int index) {
+
+        HIT_NO_WORLD(tablabelfromidx);
         /* v232: the LABEL, not the name.  Since the icon work the two are
          * different strings: the name is built to satisfy the icon lookup and
          * would read as gibberish if it were ever drawn. */
@@ -12390,7 +12975,20 @@ namespace {
     static bool s_bagPatched = false;
     static int s_bagGrown = 0;          /* 0 = not yet, 1 = done, -1 = gave up */
 
-    bool PatchInstr(uintptr_t off, u32 expected, u32 newImm, int shift, u32 mask) {
+    /* v638: how the startup code patches went.
+     *
+     * ApplyNamingFixPatch and ApplyBiggerBackpackPatches run in exl_main, where
+     * Line() is still a no-op, so their own LOGF lines have never reached the
+     * card in ANY session -- "naming: FilterDirtyWords bypass applied/REFUSED"
+     * is written to nowhere.  That matters: if the ngct bypass is refused, the
+     * name box goes back to hanging forever inside Utility.FilterDirtyWords,
+     * and a log that cannot say which of the two it was costs a whole build.
+     * Counted here, printed once when the store opens. */
+    static int s_patchOk = 0;           /* instruction patches that landed */
+    static int s_patchFail = 0;         /* sites that answered "not the code" */
+    static int s_patchNaming = -1;      /* -1 not tried, 0 refused, 1 applied */
+
+    bool PatchInstrRaw(uintptr_t off, u32 expected, u32 newImm, int shift, u32 mask) {
         /* NO Plausible()/RangeReadable() here: both are written for MANAGED
          * pointers, and Plausible() additionally demands 8-byte alignment --
          * five of the six sites are 4-mod-8, so it rejected them all and the
@@ -12417,7 +13015,7 @@ namespace {
 
     /* v239: replace a whole instruction word (when the new one is not just a
      * different immediate in the same encoding). */
-    bool PatchWord(uintptr_t off, u32 expected, u32 newWord) {
+    bool PatchWordRaw(uintptr_t off, u32 expected, u32 newWord) {
         if (g_base == 0) {
             return false;
         }
@@ -12433,6 +13031,26 @@ namespace {
         *rw = newWord;
         ctrl.Flush();
         return true;
+    }
+
+    /* v638: the counting wrappers.  Every patch in this file goes through one
+     * of these two, so one line in the log answers "did the startup patches
+     * land" without a marker file per site. */
+    bool PatchInstr(uintptr_t off, u32 expected, u32 newImm, int shift, u32 mask) {
+        if (PatchInstrRaw(off, expected, newImm, shift, mask)) {
+            ++s_patchOk;
+            return true;
+        }
+        ++s_patchFail;
+        return false;
+    }
+    bool PatchWord(uintptr_t off, u32 expected, u32 newWord) {
+        if (PatchWordRaw(off, expected, newWord)) {
+            ++s_patchOk;
+            return true;
+        }
+        ++s_patchFail;
+        return false;
     }
 
     /* Every site, or none of them.  If any site refuses, the inventory must
@@ -12502,6 +13120,7 @@ namespace {
     void ApplyNamingFixPatch() {
         /* a9bd7bfd  stp x29, x30, [sp, #-48]!   ->   d65f03c0  ret */
         const bool ok = PatchWord(kFilterDirtyOff, 0xA9BD7BFDu, 0xD65F03C0u);
+        s_patchNaming = ok ? 1 : 0;
         LOGF("naming: FilterDirtyWords bypass %s", ok ? "applied" : "REFUSED");
     }
 
@@ -12613,6 +13232,13 @@ namespace {
          * in the report) and the shopkeeper greeting disappeared, so the lift
          * is back and the panel keeps its full one-row-extra height. */
         ok = PatchWord(0x1824844u, 0x11096129u, 0x110AE129u) && ok;
+
+        /* v539: 1e (v538's grid lift) is REVERTED.  Hardware said the squeeze
+         * was ugly: moving the player's grid up one row put its first row on
+         * top of the anvil room.  The panel grows instead -- see
+         * FitGridToMenu(), which stretches these menus by 64px at runtime.
+         * Only the four ctors' inventoryYOffset could have been patched here,
+         * and it is the wrong lever for this. */
 
         /* ---- 2. the brown box: page height +64 ------------------------ */
         /* GameMenu.draw does
@@ -13027,6 +13653,8 @@ namespace {
     }
 
     bool HookAnswerDialogueAction(void* self, void* qa, void* params) {
+
+        HIT_NO_WORLD(answerdialogueaction);
         if (s_origAnswerDialogueAction == nullptr) {
             return false;               /* hook not installed: never called */
         }
@@ -13086,6 +13714,8 @@ namespace {
     }
 
     void* HookDialogueBoxCtor(void* self, void* dialogue, void* responses, int width) {
+
+        HIT_NO_WORLD(dialogueboxctor);
         if (s_origDialogueBoxCtor == nullptr) {
             return nullptr;             /* hook not installed: never called */
         }
@@ -13099,6 +13729,8 @@ namespace {
     }
 
     void* HookResponseCtor(void* self, void* key, void* text) {
+
+        HIT_NO_WORLD(responsector);
         if (s_origResponseCtor == nullptr) {
             return nullptr;             /* hook not installed: never called */
         }
@@ -13201,6 +13833,7 @@ namespace {
     constexpr uintptr_t kNetValueOff         = 0x68u;   /* every Net* value lives here */
     constexpr uintptr_t kItemParentSheetOff  = 0x68u;   /* Item.parentSheetIndex (NetInt) */
     constexpr uintptr_t kItemStackOff        = 0x98u;   /* Item.stack (NetInt) */
+    constexpr uintptr_t kItemQualityOff      = 0x90u;   /* Item.quality (NetInt) */
     constexpr uintptr_t kChestPlayerChestOff = 0x260u;  /* Chest.playerChest (NetBool) */
 
     /* ---- extra call targets ---- */
@@ -13210,6 +13843,44 @@ namespace {
      * NetString (Item.cs:68), so the field at +0x70 is a wrapper, and the
      * getter is the only honest way to read the value. */
     constexpr uintptr_t kGetItemIdOff      = SDV_OFF(kGetItemIdOff,      0x15AE860u);
+    /* Item.get_QualifiedItemId -- what ItemRegistry.Create wants. */
+    constexpr uintptr_t kGetQualifiedIdOff = SDV_OFF(kGetQualifiedIdOff,  0x15AE900u);
+
+    /* ---- v629: Community Center bundle hint ----
+     *
+     * Every address and offset below was read off the game's own code, not
+     * guessed:
+     *
+     *   NetWorldState.get_Bundles        0x1994390  ldr x0,[x0,#0xd0]; ret
+     *   NetDictionary.get_FieldDict       0x6267ba8  ldr x0,[x0,#0x58]; ret
+     *   NetArray<bool>.get_Count          0x2ea6f7c  ldr x8,[x0,#0x58]; ldr w0,[x8,#0x18]
+     *   NetArray<bool>.get_Item           0x2ea6f24  ldr x0,[x0,#0x58]; ... ldrb w0,[x0,#0x68]
+     *   NetDictionary.GetValueOrDefault   0x6268964  (returns null, never throws)
+     *   Farmer.get_CurrentItem            0x13b8fa0  (also covers the stowed item)
+     *   Item.parentSheetIndex             +0x68      (AOT field table, size 0xa0)
+     *
+     * GetValueOrDefault is used instead of the indexer on purpose: the indexer
+     * throws KeyNotFoundException for a bundle this save has never touched, and
+     * an exception unwinding through the update hook skips the rest of the
+     * frame -- that is the v464 lesson.  A missing key simply means "nothing
+     * donated yet", which is exactly what a null return is treated as. */
+    constexpr uintptr_t kFarmerCurrentItemOff =
+        SDV_OFF(kFarmerCurrentItemOff, 0x13B8FA0u);
+    constexpr uintptr_t kBundleGetOrDefaultOff =
+        SDV_OFF(kBundleGetOrDefaultOff, 0x6268964u);
+    constexpr uintptr_t kNetArrayBoolGetOff =
+        SDV_OFF(kNetArrayBoolGetOff, 0x2EA6F24u);
+    constexpr uintptr_t kNetWorldStateSlotOff =
+        SDV_OFF(kNetWorldStateSlotOff, 0xC95C260u);
+    constexpr uintptr_t kBundleDictOff       = 0xD0u;   /* NetWorldState.bundles */
+    constexpr uintptr_t kDictFieldDictOff    = 0x58u;   /* NetDictionary.fieldDict */
+    constexpr uintptr_t kNetArrayBackingOff  = 0x58u;   /* NetArray backing array */
+    constexpr uintptr_t kArrayLenOff         = 0x18u;   /* managed array length */
+    /* v536: Item.getOne -- "give me a copy of this item, stack 1".  The base
+     * implementation asks the item's own type definition, so it works for
+     * every item and needs no item-id string (which is what failed on Fire
+     * Quartz in v535). */
+    constexpr uintptr_t kGetOneOff        = SDV_OFF(kGetOneOff,          0x15B1330u);
 
     /* ---- ABI note ----
      * Vector2 is {float X, float Y}: an HFA, so it travels in s0/s1 and NOT in
@@ -13236,6 +13907,83 @@ namespace {
      * "is this a Chest?" -- reading Chest fields off a non-Chest is a wild
      * pointer. */
     static void* s_chestType = nullptr;
+
+    /* v634: Game1.get_CurrentLocation (0x14407B0) is four instructions and not
+     * one of them is a null check:
+     *
+     *     adrp x8, #0xc95c000
+     *     add  x8, x8, #0x228      ; the NetRef slot
+     *     ldr  x8, [x8]            ; x8 = the ref
+     *     ldr  x0, [x8, #0x30]     ; <- no check on x8
+     *
+     * The C# null guard does not survive AOT inlining, exactly like
+     * Farmer.get_CurrentItem in v630.  Before a world exists that ref can be
+     * null, and then the last load is a HARDWARE fault: the process stops on
+     * the spot, audio keeps playing, HOME does nothing.  The character-creation
+     * screen reaches this on every frame that happens to have no clickable
+     * menu (the frame the game hands the display to the system keyboard is one
+     * of them), which is why "tap the name box and the console dies" kept
+     * coming back after every fix that only touched our own code.
+     *
+     * So the two loads are done here, each one checked.  Every caller of the
+     * getter goes through this instead -- it never had a side effect, it is a
+     * pure read of two fields. */
+    void* SafeCurrentLocation() {
+        constexpr uintptr_t kLocRefSlot = 0xC95C228u;
+        /* v639: which of the five ways this answers "nothing" is worth one line.
+         *
+         * The getter is called from eleven places that used to go straight at
+         * 0x14407B0.  "No world yet" (a null location field) is normal and must
+         * stay silent; a *ref* that is null or unreadable is not -- it means
+         * the static slot itself is stale, which is the state that used to be a
+         * data abort.  One line per session is enough to tell them apart. */
+        static int s_locWhy = 0;
+        if (g_base == 0) {
+            return nullptr;
+        }
+        /* Only record once the log is actually open, otherwise the first frame
+         * of the process (where the ref is legitimately null) would latch the
+         * flag and the line would be written to nowhere. */
+        const bool canLog = sdlog::IsOpen();
+        void* slot = reinterpret_cast<void*>(g_base + kLocRefSlot);
+        if (!RangeReadable(slot, 8u)) {
+            if (s_locWhy == 0 && canLog) {
+                s_locWhy = 1;
+                LOGM("loc: ref slot unreadable");
+            }
+            return nullptr;
+        }
+        void* ref = *reinterpret_cast<void**>(slot);
+        if (ref == nullptr) {
+            if (s_locWhy == 0 && canLog) {
+                s_locWhy = 2;
+                LOGM("loc: ref null");
+            }
+            return nullptr;
+        }
+        if (!Plausible(ref)) {
+            if (s_locWhy == 0 && canLog) {
+                s_locWhy = 3;
+                LOGM("loc: ref %p not plausible", ref);
+            }
+            return nullptr;
+        }
+        unsigned char* cell = reinterpret_cast<unsigned char*>(ref) + 0x30u;
+        if (!RangeReadable(cell, 8u)) {
+            return nullptr;
+        }
+        void* loc = *reinterpret_cast<void**>(cell);
+        if (loc == nullptr || !Plausible(loc)) {
+            return nullptr;
+        }
+        /* A ref left over from the save that was just closed can still be
+         * mapped but no longer hold a location, so the value is checked for
+         * readability too.  A real GameLocation is far larger than this. */
+        if (!RangeReadable(loc, 0x100u)) {
+            return nullptr;
+        }
+        return loc;
+    }
 
     void* CarryPlayer() {
         auto getPlayer = reinterpret_cast<void* (*)(void*)>(g_base + kGetPlayerOff);
@@ -13512,6 +14260,8 @@ namespace {
 
     /* ---- pickup: Chest.HandleChestHit(ChestHitArgs) ---- */
     void HookChestHit(void* self, void* args) {
+
+        HIT_NO_WORLD(chesthit);
         /* `this` is always a Chest here, so this is the one place the type
          * pointer can be learned without already knowing it. */
         if (self != nullptr && RangeReadable(self, 8u)) {
@@ -13589,6 +14339,8 @@ namespace {
 
     /* ---- put back: Chest.placementAction(location, x, y, who) ---- */
     bool HookChestPlace(void* self, void* loc, int x, int y, void* who) {
+
+        HIT_NO_WORLD(chestplace);
         if (self != nullptr && RangeReadable(self, 8u)) {
             s_chestType = *reinterpret_cast<void**>(self);
         }
@@ -13631,6 +14383,8 @@ namespace {
     }
 
     bool HookCanStack(void* self, void* other) {
+
+        HIT_NO_WORLD(canstack);
         const bool r = s_origCanStack != nullptr && s_origCanStack(self, other);
         if (!r || !kCarryChest) {
             return r;
@@ -13701,7 +14455,26 @@ namespace {
         return kAutomate && g_rowOn[kRowAutomate] != 0;
     }
 
-    constexpr uintptr_t kGame1CurrentLocOff = SDV_OFF(kGame1CurrentLocOff, 0x14407B0u);
+    /* v634/v638: Game1.get_CurrentLocation (0x14407B0) is NOT callable from
+     * this module.  Its codegen is `ldr x8,[0xC95C228]` then
+     * `ldr x0,[x8,#0x30]` with no null check, so before a world exists the
+     * second load is a hardware fault.  Use SafeCurrentLocation().
+     *
+     * v638: the constant is gone, replaced by a type that has no arithmetic.
+     * Four separate freeze reports trace back to one call site that still held
+     * the raw address, and a comment cannot stop the next one.  This can:
+     * `g_base + kGame1CurrentLocOff` no longer compiles, so a new caller has
+     * to look up why before it can repeat the mistake.
+     *
+     * v639: that was not enough, because the same address had SIX aliases --
+     * kGetLocNowOff, kLocNow (three separate local copies), kLocNowQos and
+     * kGetCurrentLocMapOff -- and eleven call sites still went through them.
+     * Poisoning one name caught none of those.  All six are deleted and every
+     * site now calls SafeCurrentLocation(); `tools/check_unsafe_calls.py`
+     * scans the sources for the raw address so the next alias fails the build
+     * check instead of the console. */
+    struct NotCallable_UseSafeCurrentLocation {};
+    constexpr NotCallable_UseSafeCurrentLocation kGame1CurrentLocOff{};
     /* v487: Game1._activeClickableMenu.  Automation stands down while a menu is
      * open -- the player is very likely dragging items in a chest the cycle is
      * about to fill or drain, and game time does not advance in menus anyway. */
@@ -13828,7 +14601,6 @@ namespace {
      * goes up one tier at a time as it ages, so this is what tells you what the
      * bottle will be.  The star sprites come from Game1.mouseCursors
      * (kMouseCursorsOff, defined near the top for the festival badge). */
-    constexpr unsigned kItemQualityOff      = SDV_OFF(kItemQualityOff,      0x90u);
     /* StardewValley.Objects.Cask (size 0x228, i.e. Object 0x218 + two fields).
      * A cask does not use minutesUntilReady at all -- it ages by
      * daysToMature / agingRate, which is why it showed no bubble in v454. */
@@ -13896,8 +14668,28 @@ namespace {
      * ride this field rather than the preferences int: disconnectDay travels
      * with the farm save, which is the only write this mod still causes. */
     constexpr unsigned kDiscAnimOffBit = 0x08000000u;
+    /* v656: the bundle-hint switch, bit 28 -- the first free bit above the
+     * four byte-3 off-bits (bits 28..31 are unused).  Same encoding, set =
+     * OFF, so a value written by an earlier build reads as on. */
+    constexpr unsigned kDiscBundleOffBit = 0x10000000u;
+    /* v533: the auto sell box ratio, percent / 25 + 1, in bits 12..15 -- the
+     * only spare bits of this int that hardware proved stable (v393: bytes
+     * 2/1/0 survived a save byte for byte; it is BYTE 3 that gets rewritten, and
+     * that is where v524-v527 put this value and why it kept reading back 0).
+     *   0 = never written  -> treated as 0 % (sell nothing)
+     *   1..5 = 0/25/50/75/100 % of what arrives that gets SOLD            */
+    constexpr unsigned kDiscKeepShift = 12u;
     constexpr unsigned kDiscMaskBits = 0x0FFEu;      /* bits 1..11 */
-    constexpr unsigned kDiscMustZero = 0xF001u;      /* bit 0 + bits 12..15 */
+    /* v533: bits 12..15 carry the keep ratio now, so only bit 0 must be zero.
+     * Byte 1 is one of the bytes hardware proved stable, so this cannot be
+     * clobbered the way byte 3 was. */
+    constexpr unsigned kDiscMustZero = 0x0001u;      /* bit 0 */
+    /* v536: bit 16 -- "the one-time sweep of the sell boxes has run".
+     * Byte 2 is one of the bytes hardware proved stable (v393) and the
+     * marker test only covers bits 17..23, so this bit cannot disturb it.
+     * v426 once used bit 16 for the HUD switch; a save carrying that value
+     * simply looks "already swept", which only costs one automatic trim. */
+    constexpr unsigned kDiscClearedBit = 0x00010000u;  /* bit 16 */
 
     /* v390: disconnectDay persistence.
      *
@@ -14010,6 +14802,39 @@ namespace {
         s_discCrop = (v & kDiscCropOffBit) != 0u ? 0u : 1u;
         /* v469: the animation row, out of bit 27.  Set = OFF. */
         s_discAnim = (v & kDiscAnimOffBit) != 0u ? 0u : 1u;
+        /* v656: the bundle hint, out of bit 28.  Set = OFF. */
+        s_discBundle = (v & kDiscBundleOffBit) != 0u ? 0u : 1u;
+        /* v533/v536: the sell ratio out of bits 12..15.  0 (never written,
+         * e.g. a save made by an older build) means 0 % -- sell nothing.
+         * v533 read 0 as "keep everything", which under the old
+         * keep-the-share wording was the same thing as 0 %; with the shifted
+         * wording 100 % would mean "sell everything", so the fallback has to
+         * move to the safe end. */
+        {
+            const unsigned nib = (v >> kDiscKeepShift) & 0xFu;
+            unsigned pct = 0u;
+            if (nib == 1u) {
+                pct = 0u;
+            }
+            else if (nib == 2u) {
+                pct = 25u;
+            }
+            else if (nib == 3u) {
+                pct = 50u;
+            }
+            else if (nib == 4u) {
+                pct = 75u;
+            }
+            if (pct != s_keepPct) {
+                s_keepPct = pct;
+                s_keepRelabel = 1u;
+            }
+        }
+        /* v536: only ever RAISE this flag.  The flush that persists it runs
+         * on the next Update, so a read-back in between must not undo it. */
+        if ((v & kDiscClearedBit) != 0u) {
+            s_trimCleared = 1u;
+        }
         s_animKnown = 1;
         if (s_discAnim != s_animPushed) {
             /* The file says something we have not pushed yet (first pass of a
@@ -14025,7 +14850,8 @@ namespace {
             unsigned differ = 0;
             unsigned before = 0;
             for (int i = 1; i < kRowCount; i++) {
-                if (i == kRowHud || i == kRowGift || i == kRowCrop) {
+                if (i == kRowHud || i == kRowGift || i == kRowCrop ||
+                    i == kRowBundle || i >= kRowKeep) {
                     continue;
                 }
                 if (g_rowOn[i] != 0) {
@@ -14063,13 +14889,18 @@ namespace {
         for (int i = 1; i < kRowCount; i++) {
             g_rowOn[i] = (mask >> i) & 1u;
         }
-        /* The loop above walks all fourteen rows and bits 12/13 of `mask` are
-         * always clear, so it would switch the HUD and gift rows off once a
+        /* The loop above walks every row and `mask` holds bits 1..11 only, so
+         * it would switch the HUD, gift, crop and bundle rows off once a
          * second.  The values that belong there are the ones decoded a few
          * lines up (byte 3). */
         g_rowOn[kRowHud] = s_discHud;
         g_rowOn[kRowGift] = s_discGift;
         g_rowOn[kRowCrop] = s_discCrop;
+        /* v656: and the bundle hint row. */
+        g_rowOn[kRowBundle] = s_discBundle;
+        /* v524: the ratio row is a button, so it is always drawn checked; the
+         * value itself is in the label. */
+        g_rowOn[kRowKeep] = 1u;
         g_tractorOn = g_rowOn[kRowMaster];
         g_mapOn = g_rowOn[kRowMap];
         g_hudOn = g_rowOn[kRowHud];
@@ -14081,8 +14912,9 @@ namespace {
     void FlushMaskToDisconnectDay() {
         unsigned m = 0;
         for (int i = 1; i < kRowCount; i++) {
-            if (i == kRowHud || i == kRowGift || i == kRowCrop) {
-                continue;   /* carried in bits 24/25/26 below, not in this mask */
+            if (i == kRowHud || i == kRowGift || i == kRowCrop ||
+                i == kRowBundle || i >= kRowKeep) {
+                continue;   /* carried in bits 24..28 below, not in this mask */
             }
             if (g_rowOn[i] != 0) {
                 m |= (1u << i);
@@ -14093,7 +14925,13 @@ namespace {
             (g_rowOn[kRowHud] == 0 ? kDiscHudOffBit : 0u) |
             (g_rowOn[kRowGift] == 0 ? kDiscGiftOffBit : 0u) |
             (g_rowOn[kRowCrop] == 0 ? kDiscCropOffBit : 0u) |
+            (g_rowOn[kRowBundle] == 0 ? kDiscBundleOffBit : 0u) |
             (g_rowOn[0] == 0 ? kDiscAnimOffBit : 0u) |
+            (s_trimCleared != 0u ? kDiscClearedBit : 0u) |
+            (((s_keepPct == 0u ? 1u
+               : s_keepPct == 25u ? 2u
+               : s_keepPct == 50u ? 3u
+               : s_keepPct == 75u ? 4u : 5u) & 0xFu) << kDiscKeepShift) |
             (m & kDiscMaskBits));
         s_flushOk = ok ? 1u : 0u;
         ++s_flushCount;
@@ -14176,7 +15014,7 @@ namespace {
      * Off -- see the note in HookGameUpdate. */
     constexpr bool kTraceFlush = false;
 
-    constexpr bool kAutomateLog = true;
+    constexpr bool kAutomateLog = false;
     /* v352 bisect switch: false = harvest only, no grouping / feeding /
      * collecting.  Flip back to true once this is settled. */
     constexpr bool kAutomateRun = true;
@@ -14228,7 +15066,7 @@ namespace {
     static int s_regBinW[kRegMaxBins] = {};
     static int s_regBinH[kRegMaxBins] = {};
     static int s_regBinCount = 0;
-    static unsigned s_v521Ship = 0;
+    static unsigned s_v523Ship = 0;
     static void (*s_origObjectUpdate)(void*, void*) = nullptr;
 
     /* Read / write a Net* field's value.  NetValueSlot already validates both
@@ -14334,6 +15172,11 @@ namespace {
     static void* s_regChests[kRegMaxChests];
     static float s_regChestX[kRegMaxChests];
     static float s_regChestY[kRegMaxChests];
+    /* v523: 1 = this chest shares its group with a machine.  Set by BuildGroup,
+     * cleared by RegAddChest (the registry is rebuilt every pass).  A chest
+     * that is NOT in such a group keeps the v1.11 rule: touching the bin sells
+     * everything inside it. */
+    static unsigned char s_regChestMach[kRegMaxChests];
     static int   s_regChestCount = 0;
 
     /* v371: fish ponds seen during the same object walk. */
@@ -14361,7 +15204,13 @@ namespace {
 
     /* One group's scratch.  Fixed size, no allocation. */
     static void* s_grpChests[kRegMaxChests];
+    /* v523: the registry index of each group chest, and whether that chest
+     * touches one of the group's machines.  Placement uses both. */
+    static int   s_grpChestIdx[kRegMaxChests];
+    static unsigned char s_grpChestNearMach[kRegMaxChests];
     static int   s_grpChestCount = 0;
+    static float s_grpMachX[kRegMaxMachines];
+    static float s_grpMachY[kRegMaxMachines];
     static void* s_grpMachines[kRegMaxMachines];
     static unsigned char s_grpIsMachine[kRegMaxMachines];
     static int   s_grpMachineCount = 0;
@@ -14449,7 +15298,7 @@ namespace {
     /* location.terrainFeatures -> the inner Dictionary<Vector2,TerrainFeature>.
      * Null when it cannot be read.  Same two hops the tapper code uses. */
     void* TerrainDict() {
-        void* loc = reinterpret_cast<void* (*)()>(g_base + kGame1CurrentLocOff)();
+        void* loc = SafeCurrentLocation();
         if (loc == nullptr || !Plausible(loc) ||
             !RangeReadable(reinterpret_cast<unsigned char*>(loc) + kTapperTerrainOff, 8u)) {
             return nullptr;
@@ -14929,7 +15778,7 @@ namespace {
             /* v499: no terrain feature -- it may still be a garden pot (the crop
              * lives inside the pot object, not in terrainFeatures), or a bush /
              * fruit tree / giant crop, which are reported by their own probe. */
-            void* here0 = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+            void* here0 = SafeCurrentLocation();
             void* potDirt = nullptr;
             if (here0 != nullptr && Plausible(here0)) {
                 void* obj = ObjAt(here0, tx, ty);
@@ -15221,6 +16070,7 @@ namespace {
         s_regChests[s_regChestCount] = obj;
         s_regChestX[s_regChestCount] = x;
         s_regChestY[s_regChestCount] = y;
+        s_regChestMach[s_regChestCount] = 0;   /* BuildGroup may set it (v523) */
         ++s_regChestCount;
     }
 
@@ -15274,21 +16124,115 @@ namespace {
         RegAddMachine(obj);
     }
 
-    /* Put `item` into the first group chest that takes all of it. */
+    /* ---- v523: the sell box ----------------------------------------------
+     *
+     * A plain wooden chest (object id 130) painted the darkest swatch of the
+     * chest colour palette is a SELL BOX: whatever stands in it is sold at the
+     * end of every automation pass, with no bin adjacency and no path needed.
+     * Every other chest keeps the old behaviour, so the raw materials a machine
+     * eats from a normal chest are never sold.
+     *
+     * Why the colour value is exact: a chest's colour menu is
+     * DiscreteColorPicker, and DiscreteColorPicker.getColorFromSelection
+     * (0x177DE10) builds Color(r,g,b) as 0xFF000000 | r | g<<8 | b<<16 for
+     * selections 1..20.  v526: the marker is the palette's WHITE (selection
+     * 20 = 0xFE,0xFE,0xFE -> 0xFEFEFEFE).  Nothing else matches: a grey chest is
+     * an ordinary chest again (v527), and an unpainted one keeps
+     * Color.Transparent (alpha byte 0).
+     *
+     * Chest.playerChoiceColor is a NetColor at +0x258; NetColor keeps the packed
+     * Color at +0x68 (NetColor.get_R 0x1177A40 starts with `ldr w8,[x0,#0x68]`),
+     * the same slot every other Net* field in this project reads.
+     */
+    /* v534: DiscreteColorPicker.getColorFromSelection(int) -- the very function
+     * ItemGrabMenu calls before storing the colour into the chest.  Asking the
+     * game for swatch 20 removes every guess about byte order. */
+    constexpr uintptr_t kColorFromSelectionOff =
+        SDV_OFF(kColorFromSelectionOff, 0x177DE10u);
+    constexpr uintptr_t kChestColorPickOff = 0x258u;    /* Chest.playerChoiceColor */
+    constexpr uintptr_t kChestColorTintOff = 0x250u;    /* Chest.tint (what is drawn) */
+    constexpr unsigned  kSellBoxColor      = 0xFFFEFEFEu; /* palette 20 = white */
+    /* v532: Colour packs as r | g<<8 | b<<16 | a<<24.  The swatch is
+     * RGB(254,254,254) with alpha FF, i.e. 0xFFFEFEFE -- v523..v530 carried
+     * 0xFEFEFEFE (red FE, green FE, blue FF, alpha FE), a colour that exists
+     * nowhere, which is why the exact test never fired. */
+
+    /* Either colour field matching means the player really painted the chest
+     * black: playerChoiceColor is what the menu stores, tint is what the game
+     * derives from it before drawing, and 1.6 touches both.  Checking both costs
+     * one extra native read and removes the guess about which one survives a
+     * save. */
+    /* The packed colour of palette swatch 20 (white), straight from the game.
+     * Cached after the first call; 0 means "not resolved yet". */
+    static unsigned s_whitePack = 0;
+
+    unsigned WhitePack() {
+        if (s_whitePack == 0u) {
+            auto getColor = reinterpret_cast<unsigned (*)(int)>(
+                g_base + kColorFromSelectionOff);
+            const unsigned v = getColor(20);
+            if (v != 0u) {
+                s_whitePack = v;
+            }
+        }
+        return s_whitePack != 0u ? s_whitePack : kSellBoxColor;
+    }
+
+    bool IsSellBox(void* chest) {
+        if (chest == nullptr || !Plausible(chest)) {
+            return false;
+        }
+        /* v528: every chest variant counts -- wooden (130), stone (232), big
+         * (216), big stone (248).  The class check is authoritative once the
+         * MethodTable has been learned; the ids are the fallback for the first
+         * frames of a session. */
+        if (!IsChestObj(chest)) {
+            const int psi = ChestParentSheetIndex(chest);
+            if (psi != 130 && psi != 232 && psi != 216 && psi != 248) {
+                return false;
+            }
+        }
+        /* v532: EXACT match only -- the palette's white, nothing else.  A
+         * "light colour" rule is gone: it was a guess that happened to include
+         * the white swatch, and it would also have accepted any chest whose
+         * default tint is light.  Unpainted chests carry 0x00000000 (picker) /
+         * 0xFFFFFFFF (tint), so neither can match. */
+        const unsigned white = WhitePack();
+        void* pick = NetValueSlot(chest, kChestColorPickOff, 4u);
+        if (pick != nullptr && *reinterpret_cast<unsigned*>(pick) == white) {
+            return true;
+        }
+        void* tint = NetValueSlot(chest, kChestColorTintOff, 4u);
+        if (tint != nullptr && *reinterpret_cast<unsigned*>(tint) == white) {
+            return true;
+        }
+        return false;
+    }
+
+    /* Put `item` into a group chest.  v523 order:
+     *   1. a SELL BOX of this group -- machine output is meant to be sold, and
+     *      the box is emptied at the end of the same pass,
+     *   2. a chest that already holds this item (v489: keep a group's product
+     *      together instead of scattering it over every connected chest),
+     *   3. a chest that does NOT touch one of this group's machines -- that is
+     *      the chest the machines feed from, and dropping products there is what
+     *      made people park one product in the product chest as a marker,
+     *   4. any chest.
+     *
+     * Chest.GetItemsForPlayer() hands back an Inventory (the same object
+     * addItem uses), and Inventory.ContainsId(string) is a plain method --
+     * no interface dispatch.  Item.ItemId is the managed string it wants. */
     bool StoreInGroup(void* item, int chestCount) {
         auto addItem = reinterpret_cast<void* (*)(void*, void*)>(g_base + kChestAddItemOff);
         auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
-        /* v489: output priority.  PC Automate stores machine output in
-         *   (1) chests marked "put items here first",
-         *   (2) chests that already hold an item of the same type,
-         *   (3) any chest.
-         * We have no per-chest flags, so rule (2) is the one that matters in
-         * practice: a group's product should not be scattered across every
-         * chest just because they are all connected.
-         *
-         * Chest.GetItemsForPlayer() hands back an Inventory (the same object
-         * addItem uses), and Inventory.ContainsId(string) is a plain method --
-         * no interface dispatch.  Item.ItemId is the managed string it wants. */
+        for (int i = 0; i < chestCount; ++i) {
+            if (!IsSellBox(s_grpChests[i])) {
+                continue;
+            }
+            if (addItem(s_grpChests[i], item) == nullptr) {
+                return true;
+            }
+        }
         void* itemId = nullptr;
         if (item != nullptr && Plausible(item)) {
             itemId = reinterpret_cast<void* (*)(void*)>(g_base + kGetItemIdOff)(item);
@@ -15313,12 +16257,36 @@ namespace {
             }
         }
         for (int i = 0; i < chestCount; ++i) {
+            if (s_grpChestNearMach[i] != 0) {
+                continue;
+            }
+            if (addItem(s_grpChests[i], item) == nullptr) {
+                return true;
+            }
+        }
+        for (int i = 0; i < chestCount; ++i) {
             if (addItem(s_grpChests[i], item) == nullptr) {
                 return true;
             }
         }
         return false;
     }
+
+    /* sdlog11: feed outcome counters, one flush per pass.
+     *
+     * The per-machine "auto: in ok" / "auto: in try" lines were LOGL, i.e.
+     * dropped as soon as the token bucket is half empty, and a single pass
+     * emits hundreds of them.  A zero in the log therefore only proves "no ok
+     * line survived the bucket" -- not "no feed ever took".  Those lines cannot
+     * answer the question they were added for.
+     *
+     * Counting here and printing ONE line per pass with the deltas removes the
+     * filter from the measurement: ok/try/busy are exact for that pass, and the
+     * line is LOGF so it is written even when the bucket is low. */
+    static unsigned s_feedOk = 0;
+    static unsigned s_feedTry = 0;
+    static unsigned s_feedBusy = 0;
+    static unsigned s_feedQuiet = 0;
 
     /* Offer the group's storage to one machine.  Vanilla's AttemptAutoLoad
      * walks the inventory and stops at the first item the machine accepts, so
@@ -15328,27 +16296,152 @@ namespace {
         auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
         auto autoLoad = reinterpret_cast<bool (*)(void*, void*, void*)>(g_base + kAutoLoadOff);
         TraceStep(0x31u, machine);
-        if (kAutomateLog) {
-            LOGF("auto: in try psi=%d", ChestParentSheetIndex(machine));
-        }
+        /* v536-log: one line per attempt, written AFTER the loop, carrying the
+         * numbers that separate the three ways a feed can fail.
+         *
+         * Hardware (sdv_map.log, 484 lines) showed 409 "in try" and not one
+         * "in ok": feeding never succeeded once in a whole session, and the old
+         * line could not say why -- "the group has no items", "every chest is a
+         * sell box" and "the machine refused everything" all looked identical.
+         * The counts are what tell them apart: tried>0 means items were offered
+         * and rejected, tried==0 means there was nothing to offer.
+         *
+         * It is LOGL, not LOGF.  A single pass emitted 258 of these lines; each
+         * line is six blocking fs calls, so that one pass spent roughly 43 s of
+         * its own runtime writing the log -- and the bucket blocked every other
+         * line meanwhile.  Low priority lines are dropped under load instead of
+         * stealing the slot an event line needs. */
+        int box = 0;        /* sell boxes, contents are for sale not for feed */
+        int empt = 0;       /* empty chests */
+        int tried = 0;      /* chests actually offered to autoLoad */
         for (int i = 0; i < chestCount; ++i) {
+            if (IsSellBox(s_grpChests[i])) {
+                ++box;
+                continue;       /* v523: what is in the sell box is for sale */
+            }
             if (isEmpty(s_grpChests[i])) {
+                ++empt;
                 continue;
             }
             void* inv = getItems(s_grpChests[i]);
             if (inv == nullptr || !Plausible(inv)) {
                 continue;
             }
+            ++tried;
+            /* sdlog10-diag: one line per machine per session, printing what is
+             * actually in the chest and how it is stacked.
+             *
+             * 917 offers across three sessions, zero accepted.  Everything
+             * else is ruled out, so the only remaining gate is the one in
+             * MachineDataUtility.cs:90 --
+             *     if (trigger2.RequiredCount > inputItem.Stack)
+             * which compares the count against ONE slot's stack, not the
+             * chest total.  A Dehydrator wants 5 of the same fruit in a single
+             * slot; 2+3 in two slots (different quality does not stack) fails
+             * on both.  Printing (psi, stack, quality) for the first three
+             * non-empty slots is the only measurement that separates
+             * "wrong items" from "right items, wrong stacking".
+             *
+             * LOGF, not LOGL: at most eight of these per session, and a
+             * diagnostic that gets dropped by the token bucket is worthless. */
+            if (kAutomateLog) {
+                static int s_diagPsi[8];
+                static int s_diagCnt = 0;
+                const int mpsi = ChestParentSheetIndex(machine);
+                bool seen = false;
+                for (int d = 0; d < s_diagCnt; ++d) {
+                    if (s_diagPsi[d] == mpsi) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen && s_diagCnt < 8) {
+                    s_diagPsi[s_diagCnt++] = mpsi;
+                    auto getCount = reinterpret_cast<int (*)(void*)>(
+                        g_base + kInvCountOff);
+                    auto getItem = reinterpret_cast<void* (*)(void*, int)>(
+                        g_base + kInvGetItemOff);
+                    const int n = getCount(inv);
+                    /* sdlog11: sort the slots by stack size, not by index.
+                     * The old version printed the first three non-empty slots,
+                     * which in a mixed chest (several automation lines share
+                     * it) are almost never the stack the machine would want --
+                     * "the 5 blueberries are in slot 9" looked exactly like
+                     * "there are no blueberries".  The stack that matters for
+                     * MachineDataUtility.cs:90 is always the biggest one, so
+                     * that is what gets printed, along with how many slots are
+                     * actually occupied (f=). */
+                    constexpr int kTop = 3;
+                    int tPsi[kTop] = {-1, -1, -1};
+                    int tSt[kTop] = {-1, -1, -1};
+                    int tQ[kTop] = {-1, -1, -1};
+                    int nf = 0;
+                    for (int s = 0; s < n; ++s) {
+                        void* it = getItem(inv, s);
+                        if (it == nullptr || !Plausible(it)) {
+                            continue;
+                        }
+                        void* psiS = NetValueSlot(it, kItemParentSheetOff, 4u);
+                        void* stS  = NetValueSlot(it, kItemStackOff, 4u);
+                        void* qS   = NetValueSlot(it, kItemQualityOff, 4u);
+                        const int ipsi = psiS ? *reinterpret_cast<int*>(psiS) : -1;
+                        const int ist  = stS  ? *reinterpret_cast<int*>(stS)  : -1;
+                        const int iq   = qS   ? *reinterpret_cast<int*>(qS)   : -1;
+                        ++nf;
+                        for (int p = 0; p < kTop; ++p) {
+                            if (ist > tSt[p]) {
+                                for (int q = kTop - 1; q > p; --q) {
+                                    tPsi[q] = tPsi[q - 1];
+                                    tSt[q] = tSt[q - 1];
+                                    tQ[q] = tQ[q - 1];
+                                }
+                                tPsi[p] = ipsi;
+                                tSt[p] = ist;
+                                tQ[p] = iq;
+                                break;
+                            }
+                        }
+                    }
+                    char more[112];
+                    int ml = 0;
+                    more[0] = '\0';
+                    for (int p = 0; p < kTop && tPsi[p] >= 0; ++p) {
+                        char one[32];
+                        const int w = std::snprintf(one, sizeof(one), " %d/%d/%d",
+                                                    tPsi[p], tSt[p], tQ[p]);
+                        if (w <= 0 || ml + w >= static_cast<int>(sizeof(more))) {
+                            break;
+                        }
+                        for (int k = 0; k < w; ++k) {
+                            more[ml++] = one[k];
+                        }
+                        more[ml] = '\0';
+                    }
+                    LOGF("auto: inv psi=%d n=%d f=%d%s", mpsi, n, nf, more);
+                }
+            }
             if (autoLoad(machine, inv, pl)) {
                 TraceStep(0x32u, machine);
                 if (s_autoInput < 0xFu) {
                     ++s_autoInput;
                 }
+                ++s_feedOk;
                 if (kAutomateLog) {
-                    LOGF("auto: in ok psi=%d", ChestParentSheetIndex(machine));
+                    /* LOGF, not LOGL: a success is the rare event this whole
+                     * investigation is about, so it must not be rate-limited
+                     * away.  A pass with several successes prints one line per
+                     * success; the pass summary below carries the exact count. */
+                    LOGF("auto: in ok psi=%d ch=%d box=%d empty=%d tried=%d",
+                         ChestParentSheetIndex(machine), chestCount, box, empt,
+                         tried);
                 }
                 return;
             }
+        }
+        ++s_feedTry;
+        if (kAutomateLog) {
+            LOGL("auto: in try psi=%d ch=%d box=%d empty=%d tried=%d",
+                 ChestParentSheetIndex(machine), chestCount, box, empt, tried);
         }
     }
 
@@ -15374,6 +16467,7 @@ namespace {
         const float cy = s_regChestY[rootIdx];
 
         MarkTile(cx, cy);
+        s_grpChestIdx[s_grpChestCount] = rootIdx;
         s_grpChests[s_grpChestCount++] = s_regChests[rootIdx];
         if (s_chestDoneCount < kRegMaxChests) {
             s_chestDone[s_chestDoneCount++] = rootIdx;
@@ -15415,6 +16509,7 @@ namespace {
                     s_chestDone[s_chestDoneCount++] = i;
                 }
                 if (s_grpChestCount < kRegMaxChests) {
+                    s_grpChestIdx[s_grpChestCount] = i;
                     s_grpChests[s_grpChestCount++] = s_regChests[i];
                 }
             }
@@ -15426,6 +16521,8 @@ namespace {
                 if (s_grpMachineCount < kRegMaxMachines) {
                     s_grpMachines[s_grpMachineCount] = s_regMachines[i];
                     s_grpIsMachine[s_grpMachineCount] = s_regIsMachine[i];
+                    s_grpMachX[s_grpMachineCount] = s_regMachX[i];
+                    s_grpMachY[s_grpMachineCount] = s_regMachY[i];
                     ++s_grpMachineCount;
                 }
             }
@@ -15451,6 +16548,33 @@ namespace {
             PushTile(tail, x + 1.0f, y - 1.0f);
             PushTile(tail, x - 1.0f, y + 1.0f);
             PushTile(tail, x - 1.0f, y - 1.0f);
+        }
+
+        /* v523: two per-group hints, computed once per group per pass with no
+         * managed calls:
+         *   - s_grpChestNearMach: this chest touches one of the group's
+         *     machines, i.e. it is where the INPUTS live.  Machine output is
+         *     placed away from those (StoreInGroup rule 3).
+         *   - s_regChestMach: this chest shares its group with a machine, so
+         *     the shipping bin must not drain it (v1.11 sold its contents,
+         *     raw materials included). */
+        for (int c = 0; c < s_grpChestCount; ++c) {
+            const int idx = s_grpChestIdx[c];
+            const float gx = s_regChestX[idx];
+            const float gy = s_regChestY[idx];
+            unsigned char near = 0;
+            for (int m = 0; m < s_grpMachineCount; ++m) {
+                const float dx = s_grpMachX[m] - gx;
+                const float dy = s_grpMachY[m] - gy;
+                if (dx >= -1.0f && dx <= 1.0f && dy >= -1.0f && dy <= 1.0f) {
+                    near = 1;
+                    break;
+                }
+            }
+            s_grpChestNearMach[c] = near;
+            if (s_grpMachineCount > 0 && idx >= 0 && idx < kRegMaxChests) {
+                s_regChestMach[idx] = 1;
+            }
         }
     }
 
@@ -15509,6 +16633,59 @@ namespace {
         return id;
     }
 
+    /* v657: bundle lookups must only see plain objects.
+     *
+     * ItemIdDigits strips ANY "(X)" prefix and returns the digits, so a hat
+     * "(H)66" reads back as 66 -- which is Amethyst, a Geologist-bundle slot;
+     * a Galaxy Sword "(W)29" reads back as 29.  The bundle table is built
+     * from Data/Objects alone, so a hat, weapon, tool or clothing item can
+     * never be an ingredient: those ids were landing on the table's object
+     * rows by pure numeric collision.  That is the "I hold a hat and the HUD
+     * asks for a mineral" report.  This variant accepts only the "(O)"
+     * prefix, and refuses everything else outright. */
+    int BundleIngredientId(void* item) {
+        /* v658: read the QUALIFIED id, not the raw field.
+         *
+         * v657 read the +0x70 NetString and required an "(O)" prefix -- but
+         * that field holds bare "348" for legacy items AND "(O)348" when the
+         * game has qualified it, and on-device the held item's string is
+         * bare.  Requiring a prefix therefore rejected every single item and
+         * the whole hint went dark ("献祭没了").
+         *
+         * The discriminator has to come from somewhere else, and the game
+         * already maintains one: Item.QualifiedItemId always carries the
+         * class prefix -- "(O)74" for objects, "(H)12" hats, "(W)4" weapons,
+         * "(BC)" big craftables.  It is the same cheap string getter the
+         * auto-storage path already calls (get_ItemId), and a hat/weapon id
+         * collision can only be told apart through it. */
+        void* str = reinterpret_cast<void* (*)(void*)>(
+            g_base + kGetQualifiedIdOff)(item);
+        if (str == nullptr || !Plausible(str)) {
+            return -1;
+        }
+        const int len = ManagedStrLen(str);
+        if (len < 5 || len > 12) {
+            return -1;      /* shortest is "(O)16" */
+        }
+        if (!RangeReadable(reinterpret_cast<unsigned char*>(str) + 0x14,
+                           static_cast<size_t>(len) * 2u)) {
+            return -1;
+        }
+        const char16_t* p = reinterpret_cast<const char16_t*>(
+            reinterpret_cast<unsigned char*>(str) + 0x14);
+        if (p[0] != u'(' || p[1] != u'O' || p[2] != u')') {
+            return -1;      /* hat / weapon / tool / clothing / big craftable */
+        }
+        int id = 0;
+        for (int i = 3; i < len; ++i) {
+            if (p[i] < u'0' || p[i] > u'9') {
+                return -1;
+            }
+            id = id * 10 + (p[i] - u'0');
+        }
+        return id;
+    }
+
     /* NetFloat payload: a float in the same +0x68 slot NetInt uses. */
     bool NetFloatAt(void* owner, uintptr_t off, float* out) {
         void* slot = NetValueSlot(owner, off, 4u);
@@ -15535,16 +16712,21 @@ namespace {
         return ItemIdDigits(obj) == kCaskId;
     }
 
-    /* ---- v521: the shipping bin ------------------------------------------
+    /* ---- v521/v523: the shipping bin and the sell box ---------------------
      *
      * The bin is a Building, not an Object, so the machine groups never see it.
      * It does not need to be one: Farm.shipItem(Item, Farmer) is exactly what
      * the bin's own menu calls when the player drops an item in, and it accepts
      * whatever the bin accepts (prices, stats and lastItemShipped included).
+     * It writes the farm's own shippingBin list (farm+0x338), so selling does
+     * not depend on standing next to the building.
      *
-     * So a chest that touches the bin's footprint has its leftovers shipped at
-     * the END of the pass -- after every machine in the group has had its
-     * chance to take them, which is the priority order the PC mod uses.
+     * Two things get sold, both at the END of the pass so every machine had its
+     * chance to take the item first:
+     *   1. the contents of a SELL BOX (IsSellBox above),
+     *   2. the contents of a chest that touches the bin, or a path/floor that
+     *      reaches it -- but v523 only while that chest shares no group with a
+     *      machine, because v1.11 emptied the machine's own supply chest.
      *
      * Equipment (tools, weapons, rings, boots, clothing, trinkets: category
      * -96 and below) is deliberately left alone.  A chest of gear must not be
@@ -15578,6 +16760,8 @@ namespace {
     }
 
     void HookShippingBinUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(shippingbinupdate);
         if (AutomateOn() && s_collecting && self != nullptr) {
             RegAddBin(self);
         }
@@ -15586,13 +16770,1846 @@ namespace {
         }
     }
 
-    /* Chest tile touching a building footprint in any of the eight directions. */
-    bool ChestTouchesBin(int cx, int cy, int x0, int y0, int w, int h) {
-        return cx >= x0 - 1 && cx <= x0 + w && cy >= y0 - 1 && cy <= y0 + h;
+    /* v523: sell every item in one chest except equipment.  Returns how many
+     * were shipped; the caller owns the per-pass budget. */
+    int ShipChestItems(void* farm, void* pl, void* chest, int budget) {
+        if (budget <= 0 || farm == nullptr || pl == nullptr || chest == nullptr ||
+            !Plausible(chest)) {
+            return 0;
+        }
+        auto shipItem = reinterpret_cast<void (*)(void*, void*, void*)>(
+            g_base + kFarmShipItemOff);
+        auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
+        auto getCount = reinterpret_cast<int (*)(void*)>(g_base + kInvCountOff);
+        auto getItem = reinterpret_cast<void* (*)(void*, int)>(g_base + kInvGetItemOff);
+        auto setItem = reinterpret_cast<void (*)(void*, int, void*)>(g_base + kInvSetItemOff);
+        auto category = reinterpret_cast<int (*)(void*)>(g_base + kShipItemCategoryOff);
+        void* inv = getItems(chest);
+        if (inv == nullptr || !Plausible(inv)) {
+            return 0;
+        }
+        const int n = getCount(inv);
+        int shipped = 0;
+        for (int s = 0; s < n && shipped < budget; ++s) {
+            void* item = getItem(inv, s);
+            if (item == nullptr || !Plausible(item)) {
+                continue;
+            }
+            if (category(item) <= -96) {
+                continue;           /* equipment stays in the chest */
+            }
+            shipItem(farm, item, pl);
+            setItem(inv, s, nullptr);
+            ++shipped;
+        }
+        return shipped;
+    }
+
+    /* ---- v536: the sell box trims itself --------------------------------
+     *
+     * The ratio is the share that is SOLD.  Every pass each sell box is compared
+     * against the counts it had when we last looked; whatever appeared since --
+     * a machine's output, or items the player dropped in by hand -- is sold
+     * down by the ratio, and the rest stays put.
+     *
+     * Difference-of-counts is what makes it stable: the kept items are not sold
+     * again on the next pass (a plain "keep N %" would do that 7 times a
+     * second), so 100 items at 50 % sell 50 once and then sit still.
+     *
+     * v536 fixes three things hardware exposed in v535:
+     *   1. the snapshot is keyed by the chest's TILE, not its pointer.  Chests
+     *      are rebuilt on every load, so a pointer key lost the box and the
+     *      slots could fill up with dead pointers.
+     *   2. counts are summed per item id across slots, so an item spread over
+     *      several slots is trimmed by its total instead of per slot.
+     *   3. the sold share is taken out with Item.getOne() + a NetInt write
+     *      instead of ItemRegistry.Create(qualified id, ...).  v535 rebuilt the
+     *      sold part from an id string, that failed for Fire Quartz, and the
+     *      failure branch marked the stack "seen" -- so it was never retried.
+     *
+     * A box seen for the first time in a session is recorded and NOT sold, so
+     * stock the player keeps survives a reload.  There is exactly one
+     * exception: the first time this feature runs on a save (a bit in
+     * disconnectDay is still clear) the contents are swept once, which is how a
+     * box that was already full when the mod was installed gets trimmed.  A
+     * ratio click asks for the same one-off sweep, so "change the ratio" also
+     * means "apply it to what is in the boxes now".
+     */
+    constexpr int kSellSnapBoxes = 12;   /* white boxes tracked at once */
+    constexpr int kSellSnapIds   = 48;   /* a chest has 36 slots */
+
+    struct SellSnap {
+        unsigned char used;
+        unsigned char seen;              /* 0 = first sight: record, do not sell */
+        int x;                           /* chest tile -- survives a reload */
+        int y;
+        int id[kSellSnapIds];
+        int cnt[kSellSnapIds];
+        int debt[kSellSnapIds];          /* sub-item remainder, so 25 % works on 1s */
+    };
+    static SellSnap s_sellSnap[kSellSnapBoxes] = {};
+
+    SellSnap* SellSnapFor(int tx, int ty) {
+        for (int i = 0; i < kSellSnapBoxes; ++i) {
+            if (s_sellSnap[i].used != 0 && s_sellSnap[i].x == tx &&
+                s_sellSnap[i].y == ty) {
+                return &s_sellSnap[i];
+            }
+        }
+        for (int i = 0; i < kSellSnapBoxes; ++i) {
+            if (s_sellSnap[i].used == 0) {
+                SellSnap* sn = &s_sellSnap[i];
+                sn->used = 1;
+                sn->seen = 0;
+                sn->x = tx;
+                sn->y = ty;
+                for (int j = 0; j < kSellSnapIds; ++j) {
+                    sn->id[j] = -3;
+                    sn->cnt[j] = 0;
+                    sn->debt[j] = 0;
+                }
+                return sn;
+            }
+        }
+        return nullptr;
+    }
+
+    /* Index of `id` in the snapshot, created on demand.  -1 when full. */
+    int SellSnapSlot(SellSnap* sn, int id) {
+        for (int j = 0; j < kSellSnapIds; ++j) {
+            if (sn->id[j] == id) {
+                return j;
+            }
+        }
+        for (int j = 0; j < kSellSnapIds; ++j) {
+            if (sn->id[j] == -3) {
+                sn->id[j] = id;
+                sn->cnt[j] = 0;
+                sn->debt[j] = 0;
+                return j;
+            }
+        }
+        return -1;
+    }
+
+    /* NetInt write, the way v392 writes disconnectDay: all three copies, so the
+     * netcode interpolator has nothing to move.  No managed call. */
+    bool SetItemStack(void* item, int value) {
+        void* slot = NetValueSlot(item, kItemStackOff, 4u);
+        if (slot == nullptr) {
+            return false;
+        }
+        unsigned char* base =
+            reinterpret_cast<unsigned char*>(slot) - kNetValueOff;
+        if (!RangeReadable(base + 0x68u, 0xCu)) {
+            return false;
+        }
+        *reinterpret_cast<unsigned*>(base + 0x68u) =
+            static_cast<unsigned>(value);
+        *reinterpret_cast<unsigned*>(base + 0x6Cu) =
+            static_cast<unsigned>(value);
+        *reinterpret_cast<unsigned*>(base + 0x70u) =
+            static_cast<unsigned>(value);
+        return true;
+    }
+
+    void TrimSellBoxes(void* farm, void* pl) {
+        if (farm == nullptr || pl == nullptr) {
+            return;
+        }
+        auto shipItem = reinterpret_cast<void (*)(void*, void*, void*)>(
+            g_base + kFarmShipItemOff);
+        auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
+        auto getCount = reinterpret_cast<int (*)(void*)>(g_base + kInvCountOff);
+        auto getItem = reinterpret_cast<void* (*)(void*, int)>(g_base + kInvGetItemOff);
+        auto setItem = reinterpret_cast<void (*)(void*, int, void*)>(g_base + kInvSetItemOff);
+        auto category = reinterpret_cast<int (*)(void*)>(g_base + kShipItemCategoryOff);
+        auto getQid = reinterpret_cast<void* (*)(void*)>(g_base + kGetQualifiedIdOff);
+        auto getOne = reinterpret_cast<void* (*)(void*)>(g_base + kGetOneOff);
+        /* ItemRegistry.Create: declared further down for the bush harvester, so
+         * the address is repeated here (same value).  Only a fallback now. */
+        constexpr uintptr_t kCreateOff = SDV_OFF(kCreateOff, 0x15B98C0u);
+        auto createItem = reinterpret_cast<void* (*)(void*, int, int, void*)>(
+            g_base + kCreateOff);
+
+        s_trimDbgCrf = 0u;
+        s_trimDbgCat = 0u;
+
+        bool sweep = (s_trimSweep != 0u);
+        if (s_trimSweepReq != 0u) {
+            s_trimSweepReq = 0u;
+            for (int i = 0; i < kSellSnapBoxes; ++i) {
+                s_sellSnap[i].used = 0;     /* re-register, then sweep */
+            }
+            sweep = true;
+        }
+        if (!sweep && s_trimCleared == 0u && s_trimSwept == 0u &&
+            s_keepPct > 0u) {
+            sweep = true;                   /* first run of the feature */
+        }
+        if (sweep) {
+            s_trimSweep = 1u;
+        }
+
+        bool sawBox = false;
+        int sold = 0;
+        for (int c = 0; c < s_regChestCount && sold < 64; ++c) {
+            void* chest = s_regChests[c];
+            if (!IsSellBox(chest)) {
+                continue;
+            }
+            void* inv = getItems(chest);
+            if (inv == nullptr || !Plausible(inv)) {
+                continue;
+            }
+            const int n = getCount(inv);
+            SellSnap* sn = SellSnapFor(static_cast<int>(s_regChestX[c]),
+                                       static_cast<int>(s_regChestY[c]));
+            if (sn == nullptr) {
+                continue;
+            }
+            sawBox = true;
+
+            /* Pass 1: the total of each item id, across every slot. */
+            int aggId[kSellSnapIds];
+            int aggTotal[kSellSnapIds];
+            int aggCount = 0;
+            for (int s = 0; s < n; ++s) {
+                void* item = getItem(inv, s);
+                if (item == nullptr || !Plausible(item)) {
+                    continue;
+                }
+                if (category(item) <= -96) {
+                    ++s_trimDbgCat;         /* equipment stays in the box */
+                    continue;
+                }
+                void* stackSlot = NetValueSlot(item, kItemStackOff, 4u);
+                if (stackSlot == nullptr) {
+                    continue;
+                }
+                const int st = *reinterpret_cast<int*>(stackSlot);
+                if (st <= 0) {
+                    continue;
+                }
+                const int id = ItemIdDigits(item);
+                int k = 0;
+                while (k < aggCount && aggId[k] != id) {
+                    ++k;
+                }
+                if (k == aggCount) {
+                    if (aggCount >= kSellSnapIds) {
+                        continue;           /* cannot happen: 36 slots */
+                    }
+                    aggId[k] = id;
+                    aggTotal[k] = 0;
+                    ++aggCount;
+                }
+                aggTotal[k] += st;
+            }
+
+            if (sn->seen == 0 && !sweep) {
+                for (int k = 0; k < aggCount; ++k) {
+                    const int slot = SellSnapSlot(sn, aggId[k]);
+                    if (slot >= 0) {
+                        sn->cnt[slot] = aggTotal[k];
+                    }
+                }
+                sn->seen = 1;
+                continue;
+            }
+
+            for (int k = 0; k < aggCount; ++k) {
+                const int id = aggId[k];
+                const int total = aggTotal[k];
+                const int slot = SellSnapSlot(sn, id);
+                if (slot < 0) {
+                    continue;
+                }
+                const int prev = sweep ? 0 : sn->cnt[slot];
+                if (total <= prev) {
+                    sn->cnt[slot] = total;
+                    continue;
+                }
+                unsigned want = 0u;
+                if (s_keepPct > 0u) {
+                    sn->debt[slot] += static_cast<int>(
+                        static_cast<unsigned>(total - prev) * s_keepPct);
+                    want = static_cast<unsigned>(sn->debt[slot] / 100);
+                    sn->debt[slot] %= 100;
+                }
+                if (want == 0u) {
+                    sn->cnt[slot] = total;
+                    continue;
+                }
+
+                /* Pass 2: take it out, last slot first. */
+                unsigned left = want;
+                int took = 0;
+                for (int s = n - 1; s >= 0 && left > 0u; --s) {
+                    void* item = getItem(inv, s);
+                    if (item == nullptr || !Plausible(item)) {
+                        continue;
+                    }
+                    if (ItemIdDigits(item) != id) {
+                        continue;
+                    }
+                    void* stackSlot = NetValueSlot(item, kItemStackOff, 4u);
+                    if (stackSlot == nullptr) {
+                        continue;
+                    }
+                    const int st = *reinterpret_cast<int*>(stackSlot);
+                    if (st <= 0) {
+                        continue;
+                    }
+                    if (static_cast<unsigned>(st) <= left) {
+                        shipItem(farm, item, pl);
+                        setItem(inv, s, nullptr);
+                        left -= static_cast<unsigned>(st);
+                        took += st;
+                        continue;
+                    }
+                    const int take = static_cast<int>(left);
+                    void* part = getOne(item);
+                    if (part == nullptr || !Plausible(part)) {
+                        ++s_trimDbgCrf;
+                        void* qid = getQid(item);
+                        part = (qid != nullptr && Plausible(qid))
+                            ? createItem(qid, take, 0, nullptr) : nullptr;
+                    }
+                    if (part == nullptr || !Plausible(part)) {
+                        break;              /* retry next pass, debt kept */
+                    }
+                    if (!SetItemStack(part, take)) {
+                        ++s_trimDbgCrf;
+                        break;
+                    }
+                    shipItem(farm, part, pl);
+                    SetItemStack(item, st - take);
+                    took += take;
+                    left = 0u;
+                }
+                if (took > 0) {
+                    sn->cnt[slot] = total - took;
+                    sn->debt[slot] = 0;
+                    ++sold;
+                    s_trimDbgId = id;
+                    s_trimDbgN = total;
+                    s_trimDbgSell = took;
+                } else if (left == 0u) {
+                    sn->cnt[slot] = total;
+                }
+            }
+
+            /* Free ids that left the box, so a long session cannot fill the
+             * table with stale entries. */
+            for (int j = 0; j < kSellSnapIds; ++j) {
+                if (sn->id[j] == -3) {
+                    continue;
+                }
+                bool still = false;
+                for (int k = 0; k < aggCount; ++k) {
+                    if (aggId[k] == sn->id[j]) {
+                        still = true;
+                        break;
+                    }
+                }
+                if (!still) {
+                    sn->id[j] = -3;
+                    sn->cnt[j] = 0;
+                    sn->debt[j] = 0;
+                }
+            }
+            sn->seen = 1;
+        }
+
+        if (sold > 0 && s_autoOutput < 0xFu) {
+            ++s_autoOutput;
+        }
+
+        if (sweep && sawBox) {
+            s_trimSweep = 0u;
+            s_trimSwept = 1u;
+            if (s_trimCleared == 0u) {
+                s_trimCleared = 1u;
+                s_discDirty = 1;            /* rides the farm save */
+            }
+        }
+    }
+
+    /* v539: MenuWithInventory.inventory -- the player's grid inside a
+     * MenuWithInventory subclass.  Field offsets from the metadata:
+     * IClickableMenu x/y/width/height at +0x28/+0x2c/+0x30/+0x34, and
+     * InventoryMenu is an IClickableMenu, so its position reads the same way. */
+    constexpr uintptr_t kMenuInvFieldOff = 0x88u;
+    constexpr uintptr_t kIcXOff          = 0x28u;
+    constexpr uintptr_t kIcYOff          = 0x2Cu;
+    constexpr uintptr_t kIcHOff          = 0x34u;
+
+    /* v655: last state reported by FitGridToMenu(), so the `grid:` line is
+     * written once per menu instead of once per frame. */
+    static int   s_gridLogged = 0;
+    static void* s_gridMenu   = nullptr;
+    static int   s_gridW      = 0;
+    static int   s_gridH      = 0;
+    static int   s_gridDy     = 0;
+
+    /* the 48-slot backpack in the four small container menus.
+     *
+     * GeodeMenu / ForgeMenu / TailoringMenu / DyeMenu all build their player
+     * grid at `menu.y + 444` (inventoryYOffset 132 on top of the base 312) and
+     * their frame is 600 + 2*40 = 680 tall.  Three rows end at +636, four rows
+     * at +700, so with a 48-slot backpack the last row hangs 20px below the
+     * frame's bottom border and is drawn on top of the world behind it.
+     *
+     * The frame cannot simply be made taller at build time: MenuWithInventory
+     * is shared with ItemGrabMenu, StorageContainer, MuseumMenu and three more
+     * menus whose frames are fine as they are.
+     *
+     * So the height is raised HERE, once per menu, to 744 -- the same move the
+     * inventory page uses (its box grows by 64 instead of squeezing its
+     * contents).  The grid does not move, the anvil room is untouched.
+     *
+     * v655 -- why this never actually worked before.  v539 gated the whole
+     * thing on the frame being exactly 880 x 680:
+     *
+     *     if (width != 880 || height != 680) return;
+     *
+     * and that gate is wrong twice over.  It reads well ("only a fresh
+     * MenuWithInventory is 880 wide") but it makes the fix depend on four
+     * runtime statics -- borderWidth 40, spaceToClearTopBorder 96,
+     * spaceToClearSideBorder 16 -- being exactly what the PC source says, while
+     * the *positional* test underneath is the one that actually identifies the
+     * four menus.  If any of those statics differs by even 1, the frame is not
+     * 680, the function returns, and the fourth row silently stays outside the
+     * frame -- which is exactly the screenshot: forge frame ends at 680 with
+     * row four drawn straight over the volcano floor.
+     *
+     * The positional test needs no size at all: only the four menus park their
+     * player grid at (+48, +444) relative to the frame; every other
+     * MenuWithInventory subclass puts it at (+36, +312).  So that is now the
+     * only test, and the required height is computed from the grid's own
+     * position instead of from a constant.  A menu that does not match is left
+     * completely alone, and a frame that is already tall enough is not touched
+     * again (so this stays a one-shot per menu).
+     *
+     * The `grid:` lines below exist because this bug survived a round of
+     * testing by looking correct in the code; if it ever regresses, the log
+     * says which number moved. */
+    void FitGridToMenu() {
+        if (!RangeReadable(reinterpret_cast<void*>(g_base + kGame1MenuOff), 8u)) {
+            return;
+        }
+        void* menu = *reinterpret_cast<void**>(g_base + kGame1MenuOff);
+        if (menu == nullptr || !Plausible(menu)) {
+            return;
+        }
+        unsigned char* m = reinterpret_cast<unsigned char*>(menu);
+        if (!RangeReadable(m + kIcXOff, 0x10u)) {
+            return;
+        }
+        const int mx = *reinterpret_cast<int*>(m + kIcXOff);
+        const int my = *reinterpret_cast<int*>(m + kIcYOff);
+        const int mw = *reinterpret_cast<int*>(m + 0x30u);
+        const int mh = *reinterpret_cast<int*>(m + kIcHOff);
+        if (mw < 800 || mh < 600) {
+            return;                    /* not a full-frame container menu */
+        }
+        void* inv = *reinterpret_cast<void**>(m + kMenuInvFieldOff);
+        if (inv == nullptr || !Plausible(inv)) {
+            s_gridLogged = 0;          /* report the miss next frame */
+            return;
+        }
+        unsigned char* g = reinterpret_cast<unsigned char*>(inv);
+        if (!RangeReadable(g + kIcXOff, 0x10u)) {
+            return;
+        }
+        const int dx = *reinterpret_cast<int*>(g + kIcXOff) - mx;
+        const int gy = *reinterpret_cast<int*>(g + kIcYOff);
+        const int dy = gy - my;
+
+        /* One line per distinct state.  A menu keeps its identity until it is
+         * replaced, and the numbers only change when the frame is grown, so
+         * this writes twice per menu at most. */
+        if (s_gridLogged == 0 || s_gridMenu != menu ||
+            s_gridW != mw || s_gridH != mh || s_gridDy != dy) {
+            LOGM("grid: menu %p %dx%d inv=+%d,+%d", menu, mw, mh, dx, dy);
+            s_gridLogged = 1;
+            s_gridMenu = menu;
+            s_gridW = mw;
+            s_gridH = mh;
+            s_gridDy = dy;
+        }
+
+        if (dx != 48 || dy != 444) {
+            return;                    /* not one of the four */
+        }
+        /* grid top + four rows of 64 + the vanilla 44px margin */
+        const int want = dy + 4 * 64 + 44;
+        if (mh < want) {
+            *reinterpret_cast<int*>(m + kIcHOff) = want;
+            LOGM("grid: frame %d -> %d (menu %p)", mh, want, menu);
+        }
+    }
+
+    /* ---- v541: the Skull Cavern elevator -------------------------------
+     *
+     * Vanilla has an elevator in the mines (Buildings tile 112, on every fifth
+     * level) and none at all in the Skull Cavern: MineShaft.checkAction only
+     * opens MineElevatorMenu when `mineLevel <= 120`, and that menu caps its
+     * buttons at `Math.Min(MineShaft.lowestLevelReached, 120) / 5`.
+     *
+     * This stage does not paint a door of its own.  It hangs the elevator on
+     * the level's own DOWN LADDER (Buildings tile 115): on every fifth level of
+     * the desert mine, interacting with the ladder opens the elevator menu
+     * instead of the shaft prompt.
+     *
+     * The menu is built here rather than by hooking its constructor, which
+     * keeps the patch surface to ONE hook.  MineElevatorMenu..ctor makes 25
+     * buttons for depths 5..120; only their name strings are rewritten, and
+     * the game's own click handler
+     *     Game1.player.ridingMineElevator = true;
+     *     Game1.enterMine(Convert.ToInt32(button.name));
+     * then warps to the desert depth with no further code.  The last 24
+     * checkpoints (125 .. 240) are what one menu page can hold.
+     *
+     * Everything below is read-only apart from the menu assignment itself, and
+     * every pointer in the chain is range-checked before it is followed.
+     */
+    constexpr bool kSkullElevator = true;
+    /* v571: the Skull Cavern's entrance room ("SkullCave") is a plain
+     * GameLocation, not a MineShaft, so it has neither netTileBeneathLadder nor
+     * netElevatorLightSpot.  It gets its door the way the game paints every
+     * other elevator -- setMapTile(..., 48, "Buildings", "mine") -- and the
+     * click is caught on the base GameLocation.checkAction.
+     *
+     * Both layer strings are the game's OWN cached literals: MineShaft's
+     * setElevatorLit loads them from these two statics, so nothing has to be
+     * allocated and no length rule applies.
+     *   kLocCheckActionOff  GameLocation.checkAction -- body 0x1501600
+     *   kSetMapTileOff      GameLocation.setMapTile(self, x, y, index, layer,
+     *                       property, copyProperties, forceIndex) -- found at
+     *                       the setElevatorLit call site, w3=48 / w7=1 */
+    /* v600: THE ADDRESS THAT WAS HERE WAS NOT checkAction.
+     *
+     * v571 picked 0x1442190 because MineShaft.checkAction ends with a call to
+     * it (0x169704C) and that looked like `base.checkAction(...)`.  It is not:
+     * the class metadata says 0x1442190 is Game1.set_activeClickableMenu, the
+     * property setter for the menu slot.  So from v571 to v599 this hook sat on
+     * a setter that fires whenever ANY menu is assigned, never saw a tile, and
+     * could never open the entrance elevator -- which is exactly what the logs
+     * said: not one `entrance click` line in any build.
+     *
+     * The real body is what GameLocation.checkAction is declared with:
+     *     GameLocation.checkAction  body 0x1501600  invoker 0x7104fcc
+     * Arity agrees with the wrapper below (x0=this, x1=Location packed into
+     * x/y, x2/x3=the Rectangle halves, x4=Farmer) and the same address is what
+     * `kCheckActionOff` calls directly further down this file, so the argument
+     * layout has already been exercised. */
+    constexpr uintptr_t kLocCheckActionOff = SDV_OFF(kLocCheckActionOff, 0x1501600u);
+    constexpr uintptr_t kSetMapTileOff     = SDV_OFF(kSetMapTileOff,     0x14CBB40u);
+    /* v601: what a click on the menu's floor button ends up calling.
+     *
+     * MineElevatorMenu.receiveLeftClick does
+     *     Game1.player.ridingMineElevator = true;
+     *     Game1.enterMine(Convert.ToInt32(button.name));
+     * so the floor entry is a NUMBER, and the only way to make it mean "go back
+     * to the entrance room" is to sit on enterMine and divert that one value.
+     * Body taken from the class metadata, not from a `bl`:
+     *     Game1.enterMine  body 0x1477AD0
+     * Its prologue (`mov w20, w0` / `mov x19, x1`, then warpFarmer with
+     * w1=6, w2=6, w3=2, w4=1) is also what pinned down warpFarmer's signature. */
+    constexpr uintptr_t kEnterMineOff      = SDV_OFF(kEnterMineOff,      0x1477AD0u);
+    /* v602: the "0" button does NOT go through enterMine.
+     *
+     * 1.6's MineElevatorMenu.receiveLeftClick has a dedicated branch for it:
+     *     if (Convert.ToInt32(c.name) == 0) {
+     *         if (!(Game1.currentLocation is MineShaft)) return;
+     *         Game1.warpFarmer("Mine", 17, 4, flip: true);   // the VALLEY mine
+     *         Game1.exitActiveMenu();
+     *         continue;
+     *     }
+     *     ...ridingMineElevator = true; enterMine(Convert.ToInt32(c.name));
+     * which is why v601's enterMine hook never fired and the player came out in
+     * the ordinary mine.  The disassembly of receiveLeftClick (0x17F0900) shows
+     * the zero branch at 0x17F0A24 loading the cached "Mine" literal and calling
+     * 0x1466070 with (name, w1=0x11, w2=4, w3=1, w4=1).
+     *
+     * So the divert belongs on this warpFarmer overload instead:
+     *     Game1.warpFarmer(string, int, int, int, bool)  body 0x1466070
+     * Gated on the exact constant pair the button uses (17,4) plus "the current
+     * location really is a desert shaft", so every other warp is forwarded. */
+    constexpr uintptr_t kMineWarpOff       = SDV_OFF(kMineWarpOff,       0x1466070u);
+    /* The elevator door tile as the game's own checkAction knows it. */
+    /* v582: the door is THREE tiles tall -- the same stack the PC mod paints:
+     *   135/80  top     Front
+     *   136/96  middle  Front
+     *   189/112 bottom  Buildings   (the tile the game's checkAction calls the
+     *                                elevator, which is also our click cell)
+     * The desert tilesets carry no door art at all (measured: no tile in
+     * mine_desert*.png comes near vanilla 80/96/112), so those three images are
+     * copied into slots 135/136/189 of mine_desert*.xnb -- slots that are fully
+     * transparent in all four variants -- and the files ship in romfs.  Only
+     * vanilla pixels are involved; the PC mod's own sheets are pixel-identical
+     * to vanilla mine.png. */
+    constexpr int kElevDoorTop = 135;
+    constexpr int kElevDoorMid = 136;
+    constexpr int kElevDoorBottom = 189;
+    constexpr uintptr_t kBuildingsStrOff   = 0xBB964C0u;   /* cached "Buildings" */
+    constexpr uintptr_t kMineLayerStrOff   = 0xBB9F700u;   /* cached "mine" */
+    static void* s_entranceLoc = nullptr;   /* the SkullCave object we placed in */
+    static int   s_entranceDoor = 0;        /* 1 = door placed, 2 = gave up */
+    static constexpr int kEntranceSrc = 8;  /* s_elevSrc value: handled here */
+    /* v573: OFF.  v571 and v572 both ended in a crash and neither wrote a single
+     * "elevator:" line, which means the entrance code never ran in either one --
+     * so whatever is crashing is not this feature (or it is crashing before the
+     * room is even built).  Keep it compiled and off until a log proves where
+     * the game died. */
+    /* v580: off again.  This room's name is "SkullCave" (9 characters), so
+     * MakeFreshString cannot build the 9-character "Buildings" from it -- the
+     * source must differ in length -- and the game's own cached literal is not
+     * a string at runtime.  The entrance needs a different source string; that
+     * is the next piece of work, not something to guess at on hardware. */
+    /* v585: off again, and this time we know why it hangs.
+     *
+     * v584's log reached "entrance names ok" and then stopped inside the FIRST
+     * setMapTile -- the call passes the tilesheet id "mine", which the desert
+     * MINE maps accept (v578 wrote a tile through it) but the entrance room's
+     * map does not have; setMapTile then dereferences a tile sheet it never got.
+     * Finding that room's own sheet id needs xTile offsets this project does not
+     * have yet, so the mine path goes first. */
+    /* v588: off.  null deadlocks exactly like "mine" did (v587 stopped after
+     * "entrance names ok", before the first setMapTile returned), so neither a
+     * real id nor a null one lets us write into that room's map: xTile is being
+     * handed a tile sheet it does not have and spins on it.
+     *
+     * The door art for that room needs the map's real sheet id, which means
+     * reading xTile's own structures (map.TileSheets -> TileSheet.Id).  That is
+     * a separate piece of reverse engineering, not something to keep probing on
+     * hardware: two builds in a row hung there. */
+    /* v590: off again.  v589 used the id the map DATA declares
+     * ("untitled tile sheet", confirmed in three independent conversions of
+     * Maps/SkullCave) and setMapTile still blocked on the first call, so the
+     * runtime sheet id is not the one the data file names -- reading that needs
+     * xTile field offsets, which this project does not have.
+     *
+     * PC mods solve it by adding their OWN tile sheet (new TileSheet +
+     * map.AddTileSheet), which needs the xTile constructor address.  Until that
+     * reconnaissance exists the entrance room stays vanilla and the elevator
+     * starts one ladder down, on level 121 -- which works. */
+    /* v597: ON AGAIN, but without painting anything.
+     *
+     * Every hang above came from setMapTile.  The room already carries a stone
+     * door in its Buildings layer that nothing in the map data binds to, so the
+     * elevator hangs on that instead -- no tilesheet id, no new art, nothing
+     * that can deadlock.  See PrepEntranceElevator. */
+    constexpr bool kEntranceElevator = true;
+    /* v572: the door is placed, but the base GameLocation.checkAction hook is
+     * NOT installed.  v571 had both new things at once and the game closed with
+     * an error; the placement is the safe half, so it gets verified on its own
+     * before the click path is switched on again. */
+    constexpr bool kEntranceClick = true;
+    /* v564: netMineLevel (+0x350) is no longer read.  Its offset was never
+     * verified against IL2CPP metadata, and the level is in the location name
+     * anyway -- see the loop in MaybePrepElevator. */
+    constexpr uintptr_t kMineLadderOff      = 0x360u;   /* netTileBeneathLadder, NetPoint */
+    constexpr uintptr_t kMineCheckActionOff = SDV_OFF(kMineCheckActionOff, 0x1696A40u);
+    constexpr uintptr_t kMineElevCtorOff    = SDV_OFF(kMineElevCtorOff,    0x17F03F0u);
+    constexpr uintptr_t kMineAreaOff        = SDV_OFF(kMineAreaOff,        0x167FB60u);
+    constexpr uintptr_t kTileIndexAtOff     = SDV_OFF(kTileIndexAtOff,     0x1502FE0u);
+    /* v597: GameLocation.getTileSheetIDAt(int x, int y, string layer), three
+     * arguments after `this` -- see the note in PrepEntranceElevator. */
+    constexpr uintptr_t kTileSheetIdAtOff   = SDV_OFF(kTileSheetIdAtOff,   0x152B530u);
+    constexpr uintptr_t kPrepElevOff        = SDV_OFF(kPrepElevOff,        0x1695F80u);
+    constexpr uintptr_t kSetElevLitOff      = SDV_OFF(kSetElevLitOff,      0x16819D0u);
+    constexpr uintptr_t kGetElevSpotOff     = SDV_OFF(kGetElevSpotOff,     0x1680100u);
+
+    /* MineShaft.checkAction(Location, xTile.Dimensions.Rectangle, Farmer):
+     * the Location is packed into x1 (x low, y high) -- verified at 0x1696AF8
+     * (`mov w1, w20` / `lsr x2, x20, #32`), the Rectangle takes x2/x3 and the
+     * Farmer is x4 (`mov x21, x4` then IsLocalPlayer).  Forwarding all five
+     * registers unchanged keeps the original correct whatever the order is. */
+    using MineCheckActionFn = bool (*)(void*, long, long, long, void*);
+    static MineCheckActionFn s_origMineCheckAction = nullptr;
+    /* v542: the spot the game's own prepareElevator() picked on this level
+     * (-1 = none).  The door is the game's OWN art (Buildings tile 48/80),
+     * so nothing is drawn or invented here -- the mines' own elevator tiles
+     * are simply lit in the desert mine as well. */
+    static void* s_elevLoc = nullptr;
+    static int s_elevSpotX = -1;
+    static int s_elevSpotY = -1;
+    static int s_elevPrepLevel = -1;
+    static int s_elevDbgLevel = 0;
+    /* 0 trying / 1 the map's own door / 2 a door placed next to the ladder /
+     * 3 this floor does not get one / 4 no door and no ladder to hang it on */
+    static int s_elevSrc = 0;
+    static int s_elevTries = 0;
+
+    /* A live "Buildings" string.  MakeFreshString pads its source and returns a
+     * substring, so the source must not already be 9 characters long.
+     *
+     * v558: built fresh on every call.  It used to be cached in a native
+     * static, and a managed string that no managed object references is not a
+     * GC root -- the cache could hand MakeFreshString a pointer to collected
+     * memory.  The call sites are an A press in a mine and a menu open, so two
+     * small allocations there are free. */
+    void* NewSkullElevatorMenu() {
+        auto ctor = reinterpret_cast<void* (*)(void*)>(g_base + kMineElevCtorOff);
+        void* menu = ctor(nullptr);
+        if (menu == nullptr || !Plausible(menu) || !RangeReadable(menu, 0x70u)) {
+            return nullptr;
+        }
+        return menu;
+    }
+
+    /* Put the Skull Cavern's depths on the menu's buttons.
+     *
+     * `name` is what the game's own click handler parses
+     * (Convert.ToInt32(button.name) -> Game1.enterMine), so it keeps the
+     * INTERNAL level (121 = the desert mine's first floor).  `label` is what
+     * draw() puts on the button, so it shows the depth the player sees on the
+     * HUD: 5, 10, ... 120.
+     *
+     * Returns the number of buttons rewritten, or -1 when the button list
+     * cannot be read -- the caller then closes the menu again, because a
+     * half-relabelled menu would warp the player into the VALLEY mine.
+     *
+     * v558: THE BUG THAT CRASHED THE SKULL CAVERN.
+     *
+     * A List<T> in this build holds `list+0x10 = the ARRAY object`, and the
+     * element data is `array+0x10`; the game's own List.Add at 0x1709C90 does
+     *     ldr x9,[x19,#0x10]   ; array
+     *     ldr x9,[x9,#0x10]    ; element data
+     *     str x20,[x9,w8,sxtw #3]
+     * and its capacity is `*(int*)(*(void**)(array+0x20))`.
+     * v542..v557 read the element array straight out of `list+0x10`, i.e. they
+     * indexed the ARRAY OBJECT itself.  Every `items[i]` was therefore one of
+     * that object's fields:
+     *     i=2  -> the element-data pointer   -> the stores hit buffer[4..5]
+     *     i=4  -> the capacity pointer       -> the stores hit the int after it
+     *     i>=5 -> whatever follows the object -> arbitrary heap objects
+     * So building the menu silently wrote managed string pointers into the
+     * wrapper, into the real button array and into unrelated objects, but the
+     * *buttons* (the only thing a screenshot shows) were never touched -- the
+     * menu looked perfectly normal.  The corrupted heap then killed the game
+     * on the next menu/location change, which is why "leaving the Skull
+     * Cavern" crashed. */
+    /* Defined lower, next to IsMineShaftLocation. */
+    void* LocNameStr(void* loc);
+
+    int RelabelSkullElevatorMenu(void* menu, void* shaft) {
+        void* list = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(menu) + 0x68u);
+        if (list == nullptr || !Plausible(list) ||
+            !RangeReadable(reinterpret_cast<unsigned char*>(list) + 0x10u, 0xCu)) {
+            return -1;
+        }
+        void* array = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(list) + 0x10u);
+        void** items = array != nullptr
+                           ? *reinterpret_cast<void***>(
+                                 reinterpret_cast<unsigned char*>(array) + 0x10u)
+                           : nullptr;
+        const int count = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(list) + 0x18u);
+        void* capCell = array != nullptr
+                            ? *reinterpret_cast<void**>(
+                                  reinterpret_cast<unsigned char*>(array) + 0x20u)
+                            : nullptr;
+        if (items == nullptr || capCell == nullptr ||
+            !RangeReadable(capCell, 4u) || count < 2 || count > 64 ||
+            *reinterpret_cast<int*>(capCell) < count ||
+            !ListRangeOk(items, count)) {
+            return -1;
+        }
+        /* "Buildings" doubles as the padding source: MakeFreshString needs a
+         * source that is not already the requested length, and 9 characters
+         * differ from every label we build here. */
+        /* v571: the padding source is the location's own name.  It used to be
+         * a freshly built "Buildings", which the entrance room cannot provide
+         * (its name is exactly 9 characters, and MakeFreshString needs a source
+         * of a different length).  Any name works: the two lengths that would
+         * collide are 3 (the button name) and 1..3 (the label), and every
+         * location name is 9 or 15..24. */
+        void* pad = LocNameStr(shaft);
+        if (pad == nullptr || !Plausible(pad)) {
+            return -1;
+        }
+        const int padLen = ManagedStrLen(pad);
+        if (padLen < 2) {
+            return -1;
+        }
+        int relabelled = 0;
+        for (int i = 0; i < count; ++i) {
+            void* cc = items[i];
+            if (cc == nullptr || !Plausible(cc) || !RangeReadable(cc, 0x30u)) {
+                continue;
+            }
+            /* v586: button 0 was left alone by the old loop (it started at 1),
+             * so it kept the vanilla menu's floor "0" -- and clicking it warped
+             * to the VALLEY mine (Game1.enterMine(0) is the mine entrance).
+             * It becomes the Skull Cavern's own first floor instead, and the
+             * rest keep the five-step ladder (125 .. 240).
+             *
+             * v601: it now means THE ENTRANCE ROOM, not level 1.  The name is
+             * "000" and the label "0", and HookEnterMine turns that one value
+             * into a warp back to SkullCave -- nothing is lost, because level 1
+             * is one step from the room's own door anyway, and coming back up
+             * was the only trip the menu could not make. */
+            const int level = (i == 0) ? 0 : 120 + i * 5;
+            const int shown = (i == 0) ? 0 : i * 5;
+            char16_t nm[3] = {
+                static_cast<char16_t>(u'0' + level / 100),
+                static_cast<char16_t>(u'0' + (level / 10) % 10),
+                static_cast<char16_t>(u'0' + level % 10)};
+            char16_t lb[3];
+            int lbLen = 0;
+            if (shown >= 100) {
+                lb[lbLen++] = static_cast<char16_t>(u'0' + shown / 100);
+            }
+            if (shown >= 10) {
+                lb[lbLen++] = static_cast<char16_t>(u'0' + (shown / 10) % 10);
+            }
+            lb[lbLen++] = static_cast<char16_t>(u'0' + shown % 10);
+            if (padLen == 3 || padLen == lbLen) {
+                continue;
+            }
+            /* One allocation at a time: the name is stored into the button
+             * (now rooted by the menu) before the label is built. */
+            void* nameStr = MakeFreshString(pad, nm, 3);
+            if (nameStr == nullptr) {
+                continue;
+            }
+            *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(cc) + 0x20u) = nameStr;
+            void* labelStr = MakeFreshString(pad, lb, lbLen);
+            if (labelStr != nullptr) {
+                *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(cc) + 0x28u) = labelStr;
+            }
+            ++relabelled;
+        }
+        return relabelled;
+    }
+
+    /* Light the level's elevator.  Option A of the design: the door shows up
+     * on the desert mine's FIRST floor and on every fifth one, exactly like
+     * the PC mine.
+     *
+     * Two sources, in this order:
+     *   1. MineShaft.prepareElevator() -- the game's own routine.  It looks for
+     *      Buildings tile 80 (the unlit door the PC maps carry) and records the
+     *      spot; setElevatorLit() then turns it into tile 48 and adds the light.
+     *      Vanilla never lets this run for area 121 (`checkAction`'s
+     *      `mineLevel <= 120` gate is the other half).
+     *   2. If the level's map has no such tile, the door is placed next to the
+     *      level's own down-ladder (netTileBeneathLadder): the spot is written
+     *      into netElevatorLightSpot and the same setElevatorLit() paints the
+     *      vanilla 48 tile there.  No new art, no map file edits.
+     *
+     * The level's map can be missing for a frame or two after a warp, so this
+     * retries instead of giving up on the first attempt. */
+    /* A mine level or the Skull Cavern: both are MineShaft objects whose Name
+     * starts with "UndergroundMine" (followed by the level number -- see the
+     * v563 note inside).  This check has to come FIRST.
+     *
+     * MineShaft.getMineArea(this, -1) dereferences this.netMineLevel at +0x350,
+     * and only a MineShaft has a NetInt there.  v543 called it on whatever
+     * Game1.currentLocation happened to be -- the farm, the town, Robin's
+     * house -- and dereferenced an unrelated field as a pointer.  That is the
+     * "software error" the console showed.  Nothing below reads a MineShaft
+     * field off a location that is not one. */
+    /* v564 diagnostics: filled in by IsMineShaftLocation / MaybePrepElevator so
+     * the panel can say WHICH check said no.  v563's screenshot showed
+     * "lvl=0 spot=-1,-1 src=?" -- i.e. the function bailed before it read a
+     * level, and there was no way to tell the name check from the field read. */
+    static int s_elevNmLen = -1;      /* characters in the location name, -1 = unreadable */
+    static int s_elevNmChar0 = 0;     /* first two characters, for the panel */
+    static int s_elevNmChar1 = 0;
+    static int s_elevLvlSrc = 0;      /* 1 = from the name, 0 = nothing */
+    static int s_elevRangeOk = 0;     /* v566: the whole-object range check passed */
+    static int s_elevLogged = 0;     /* v568: one shaft-test line per location */
+
+    /* The location's own Name string, without the length/prefix checks. */
+    void* LocNameStr(void* loc) {
+        if (loc == nullptr || !Plausible(loc)) {
+            return nullptr;
+        }
+        void* slot = NetValueSlot(loc, kLocNameOff, 8u);
+        if (slot == nullptr) {
+            return nullptr;
+        }
+        void* str = *reinterpret_cast<void**>(slot);
+        return (str != nullptr && Plausible(str)) ? str : nullptr;
+    }
+
+    /* Build any short ASCII string as a fresh managed string, using the
+     * location's name as the padding source.  MakeFreshString requires the
+     * source and the target to differ in length, so when the name happens to
+     * have the same length the 5-character "Front" is made first and used as
+     * the source instead.
+     *
+     * v582..v587 built these by hand, one call site at a time; the entrance room
+     * then needed a THIRD name (its map calls the desert sheet
+     * "untitled tile sheet", 20 characters), which is why this is generic now. */
+    bool BuildAsciiStr(void* loc, const char16_t* want, int n, void** out) {
+        void* pad = LocNameStr(loc);
+        if (pad == nullptr || !Plausible(pad)) {
+            return false;
+        }
+        if (ManagedStrLen(pad) == n) {
+            static const char16_t kFront[5] = {u'F', u'r', u'o', u'n', u't'};
+            void* mid = MakeFreshString(pad, kFront, 5);
+            if (mid == nullptr || !Plausible(mid) || ManagedStrLen(mid) != 5) {
+                return false;
+            }
+            pad = mid;
+        }
+        *out = MakeFreshString(pad, want, n);
+        return *out != nullptr && Plausible(*out) && ManagedStrLen(*out) == n;
+    }
+
+    bool BuildLayerNames(void* loc, void** buildings, void** front) {
+        static const char16_t kFront[5] = {u'F', u'r', u'o', u'n', u't'};
+        static const char16_t kBld[9] = {u'B', u'u', u'i', u'l', u'd', u'i',
+                                         u'n', u'g', u's'};
+        return BuildAsciiStr(loc, kFront, 5, front) &&
+               BuildAsciiStr(loc, kBld, 9, buildings);
+    }
+
+    /* The tilesheet id the game's own setElevatorLit passes for mine levels. */
+    bool BuildSheetId(void* loc, void** sheet) {
+        static const char16_t kMine[4] = {u'm', u'i', u'n', u'e'};
+        return BuildAsciiStr(loc, kMine, 4, sheet);
+    }
+
+    /* v589: the Skull Cavern ENTRANCE ROOM's map (Maps/SkullCave) has two tile
+     * sheets, and the desert one's id is xTile's default -- read straight out of
+     * the map data (svmod-lab/out/full/SkullCave.json):
+     *     [ {id: "paths",           src: "paths"},
+     *       {id: "untitled tile sheet", src: "Mines\mine_desert"} ]
+     * That is why "mine" and null both deadlocked: neither id exists there, and
+     * setMapTile dereferences the sheet it failed to find.  The desert sheet is
+     * the one we already patched with the door art, so this id is all we need.
+     *
+     * v597: the id BUILDER is gone -- "untitled tile sheet" hung as well (v589),
+     * and the room no longer needs a painted door at all.  What stays is the
+     * finding: the id xTile loads is not the id the map file names, so any future
+     * attempt has to read it off a tile (SheetIdAtTile) instead of naming it. */
+
+    /* v592: find the level's down-ladder the way the PC mod does -- tile 115 in
+     * the Buildings layer -- instead of trusting netTileBeneathLadder, which on
+     * some level shapes points at the wall top rather than the ladder's row and
+     * put the door two tiles off.
+     *
+     * Bounds are the map's own layer size, read from the map object at +0x60
+     * (xTile.Map.Layers is not available to us, so this stays a fixed 80x64
+     * window with an early exit -- the same window the entrance scan used). */
+    bool FindLadderTile(void* loc, void* buildings, void* sheet, int* outX,
+                        int* outY, int* outTile) {
+        if (buildings == nullptr || !Plausible(buildings) ||
+            sheet == nullptr || !Plausible(sheet)) {
+            return false;
+        }
+        /* v594: getTileIndexAt takes THREE arguments after `this`.
+         *
+         * MineShaft.checkAction calls it as
+         *     getTileIndexAt(tileLocation, "Buildings", "mine")
+         * -- layer AND tile sheet id.  v593 passed only the layer, so the third
+         * register carried whatever was left over and the call died inside
+         * xTile on the first tile (the log stops right after "shaft nm=18"). */
+        auto tileAt = reinterpret_cast<int (*)(void*, long, void*, void*)>(
+            g_base + kTileIndexAtOff);
+        for (int y = 0; y < 64; ++y) {
+            for (int x = 0; x < 80; ++x) {
+                const long pt = static_cast<long>(static_cast<unsigned>(x)) |
+                                (static_cast<long>(static_cast<unsigned>(y))
+                                 << 32);
+                const int t = tileAt(loc, pt, buildings, sheet);
+                /* 115 = the leave-mine ladder, 173 = stairs down, 174 = shaft.
+                 * v593: the desert mine uses 173 -- v592 scanned only 115, found
+                 * nothing, and fell back to netTileBeneathLadder, which put the
+                 * door one row off on the level in the screenshot. */
+                if (t == 115 || t == 173 || t == 174) {
+                    *outX = x;
+                    *outY = y;
+                    *outTile = t;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /* v595: is there real terrain at this cell?
+     *
+     * Same three-argument call the ladder scan uses (Location, layer,
+     * tileSheetId) -- the arity trap from v593 applies here too, so the
+     * signature is copied, not guessed.  A null layer is refused rather than
+     * passed on: xTile would read it as "any tile sheet", which is not the
+     * question being asked. */
+    int TileIdxAt(void* loc, void* layer, void* sheet, int x, int y) {
+        if (layer == nullptr || x < 0 || y < 0 || x > 79 || y > 63) {
+            return -1;
+        }
+        auto tileAt = reinterpret_cast<int (*)(void*, long, void*, void*)>(
+            g_base + kTileIndexAtOff);
+        const long pt = static_cast<long>(static_cast<unsigned>(x)) |
+                        (static_cast<long>(static_cast<unsigned>(y)) << 32);
+        return tileAt(loc, pt, layer, sheet);
+    }
+
+    /* One bit per row the door needs, base first:
+     *   1 = the row in front (base+1), 2 = bottom tile, 4 = middle, 8 = top.
+     *
+     * v596: TWO layers, because v595 found out the hard way that one is not
+     * enough.  The hardware log of the whole cavern read
+     *     side r=7 l=7 / r=3 l=3 / r=15 l=15
+     * i.e. the bottom row and the row in front were always there and the
+     * middle/top rows were usually NOT -- on levels whose door looks perfectly
+     * fine.  So the tall rock face behind a door is not a Back tile: Back
+     * carries the floor and the wall's footing, Front carries the face (which
+     * is also the layer our door's middle and top go on).  Probing Back alone
+     * therefore scored every level the same and never flipped a single door.
+     *
+     * The floor is still a Back question; the wall face is a Front question. */
+    void ProbeSide(void* loc, void* back, void* front, void* sheet, int x,
+                   int baseY, int* backMask, int* frontMask, int* baseIdx) {
+        int b = 0;
+        int f = 0;
+        const int rows[4] = {baseY + 1, baseY, baseY - 1, baseY - 2};
+        for (int i = 0; i < 4; ++i) {
+            if (TileIdxAt(loc, back, sheet, x, rows[i]) >= 0) b |= 1 << i;
+            if (i > 0 && TileIdxAt(loc, front, sheet, x, rows[i]) >= 0) {
+                f |= 1 << i;
+            }
+        }
+        *backMask = b;
+        *frontMask = f;
+        *baseIdx = TileIdxAt(loc, back, sheet, x, baseY);
+    }
+
+    /* A door reads as "in the wall" when there is ground in front of it and a
+     * rock face behind its middle and top rows -- at least two of the three,
+     * because the face's top edge moves with the layout. */
+    bool SideLooksSolid(int backMask, int frontMask) {
+        if ((backMask & 1) == 0) {
+            return false;                       /* nothing to stand on */
+        }
+        const int face = frontMask & 14;        /* the three door rows */
+        int n = 0;
+        if (face & 2) ++n;
+        if (face & 4) ++n;
+        if (face & 8) ++n;
+        return n >= 2;
+    }
+
+    /* v597: the tile sheet a map cell is actually drawn from, at RUNTIME.
+     *
+     * The map data names the desert sheet "untitled tile sheet" and that id
+     * cannot be handed to setMapTile (v584..v589 hung on it); xTile registers
+     * its own id at load time.  This asks the cell itself, so the answer cannot
+     * disagree with what is loaded.  Returns null when the cell is empty, when
+     * the read fails, or when the id is not a plausible string -- every caller
+     * treats null as "no tile here", so nothing downstream trusts a bad read. */
+    void* SheetIdAtTile(void* loc, int x, int y, void* layer) {
+        if (layer == nullptr || x < 0 || y < 0 || x > 79 || y > 63) {
+            return nullptr;
+        }
+        auto f = reinterpret_cast<void* (*)(void*, int, int, void*)>(
+            g_base + kTileSheetIdAtOff);
+        void* id = f(loc, x, y, layer);
+        if (id == nullptr || !Plausible(id)) {
+            return nullptr;
+        }
+        const int len = ManagedStrLen(id);
+        if (len <= 0 || len > 64) {
+            return nullptr;
+        }
+        return id;
+    }
+
+    bool NameHasPrefix(const void* str, const char16_t* want, int n) {
+        for (int i = 0; i < n; ++i) {
+            if (ManagedStrChar(str, i) != want[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool IsMineShaftLocation(void* loc) {
+        s_elevNmLen = -1;
+        s_elevNmChar0 = 0;
+        s_elevNmChar1 = 0;
+        void* str = LocNameStr(loc);
+        if (str == nullptr) {
+            return false;
+        }
+        s_elevNmLen = ManagedStrLen(str);
+        s_elevNmChar0 = static_cast<int>(ManagedStrChar(str, 0));
+        s_elevNmChar1 = static_cast<int>(ManagedStrChar(str, 1));
+        /* v563: THE CHECK THAT KEPT THIS FEATURE DEAD.
+         *
+         * A mine level's Name is not "UndergroundMine": it is
+         * `MineShaft.GetLevelName(level)`, i.e. "UndergroundMine" + the level
+         * number -- "UndergroundMine121" (18 characters) for the desert mine's
+         * first floor, and an optional ":layout" suffix on top of that.
+         *
+         * v541..v562 compared the length for EQUALITY with 15, so this was
+         * false for every real mine level: MaybePrepElevator returned before
+         * doing anything, no door was ever placed, no menu was ever built, and
+         * not even the "elevator:" log line was written.  On hardware that
+         * reads as "the Skull Cavern has no elevator, exactly like vanilla" --
+         * which is what the 2026-11-18 report said, with an empty log to match.
+         *
+         * Compare the prefix and let the digits follow. */
+                    /* v574: STOP COMPARING FIFTEEN CHARACTERS.
+         *
+         * The hardware log says the name is "UndergroundMine121" (the "loc:"
+         * line prints it, 18 characters) and this function still answered "no".
+         * Rather than keep guessing which index disagrees, the test now uses the
+         * three characters that are known to read correctly on the console: the
+         * log guard already proves 'U' and 'n' compare true, and the level
+         * number starts at index 15.
+         *
+         * Anything that starts with "Un" and has a digit at 15 is a MineShaft
+         * level; the digits are parsed by the caller. */
+        const int len = ManagedStrLen(str);
+        if (len < 16 || len > 24) {
+            return false;
+        }
+        const char16_t c15 = ManagedStrChar(str, 15);
+        return s_elevNmChar0 == u'U' && s_elevNmChar1 == u'n' &&
+               c15 >= u'0' && c15 <= u'9';
+    }
+
+    /* The Skull Cavern's entrance room: GameLocation named exactly "SkullCave". */
+    bool IsSkullCaveLocation(void* loc) {
+        void* str = LocNameStr(loc);
+        s_elevNmLen = str != nullptr ? ManagedStrLen(str) : -1;
+        s_elevNmChar0 = str != nullptr ? static_cast<int>(ManagedStrChar(str, 0)) : 0;
+        s_elevNmChar1 = str != nullptr ? static_cast<int>(ManagedStrChar(str, 1)) : 0;
+        if (str == nullptr || s_elevNmLen != 9) {
+            return false;
+        }
+        static const char16_t kWant[9] = {
+            u'S', u'k', u'u', u'l', u'l', u'C', u'a', u'v', u'e'};
+        return NameHasPrefix(str, kWant, 9);
+    }
+
+    /* v598: PAINT THE MINE'S DOOR INTO THE ENTRANCE ROOM -- and the reason the
+     * five earlier attempts hung is finally known, so this is not a blind retry.
+     *
+     * v584..v589 each stopped inside the first setMapTile of Maps/SkullCave and
+     * the guess was that xTile renames the sheet at load time.  It does not.
+     * v597 asked the map itself with getTileSheetIDAt and the log answered
+     *
+     *     elevator: entrance door at 1,4 (the room's own, sheet untitled tile sheet)
+     *
+     * which is exactly the id the map data declares.  The bug was the LENGTH:
+     * the old kId[20] held 19 characters ("untitled tile sheet": untitled=8,
+     * space, tile=4, space, sheet=5) and was built with n=20, so MakeFreshString
+     * wrote a trailing NUL into the id.  A 20-character id matches nothing, the
+     * sheet lookup returns null, and that is the deadlock.
+     *
+     * So: read the id off a tile that is already on this map -- a string the
+     * game itself produced cannot be the wrong length -- and paint the door the
+     * same way the mine levels get theirs.
+     *
+     * Where: column 8, rows 2..4, bottom row 4.
+     *
+     * v598 first put it at column 7 with the bottom on row 3 and the door hung
+     * one row above the floor on hardware -- the room's floor is NOT level.  The
+     * Back layer says which row a door may stand on: the wall's footing tile is
+     * 218, and that row varies with the column --
+     *     col 1..7  -> row 3      col 8,9 -> row 4      col 10..13 -> row 3
+     * so column 7 and column 8 need different bottoms for the same look.  Column
+     * 8 sits in the recess between the lamp and the skull relief, and its
+     * footing row (4) is the row whose tile at (8,5) is the cobbled walkway. */
+    static constexpr int kEntranceDoorX = 8;
+    static constexpr int kEntranceDoorY = 4;
+
+    void PrepEntranceElevator(void* loc) {
+        /* The spot never changes -- the map is fixed -- and it has to be put
+         * back on EVERY visit: the room is one cached location object, so the
+         * door is only painted once, while MaybePrepElevator clears the spot
+         * every time the current location changes (leave the room, come back,
+         * and the painted door would answer nothing). */
+        if (s_entranceLoc == loc && s_entranceDoor == 1) {
+            s_elevSpotX = kEntranceDoorX;
+            s_elevSpotY = kEntranceDoorY;
+            return;
+        }
+        if (s_entranceLoc == loc && s_entranceDoor == 2) {
+            return;                     /* already gave up on this room */
+        }
+        s_entranceLoc = loc;
+        s_entranceDoor = 0;
+        void* buildings = nullptr;
+        void* front = nullptr;
+        if (!BuildLayerNames(loc, &buildings, &front)) {
+            s_entranceDoor = 2;
+            LOGF("elevator: entrance: could not build the strings");
+            return;
+        }
+        /* The sheet id, read from the very cells we are about to overwrite. */
+        void* sheet = SheetIdAtTile(loc, kEntranceDoorX, kEntranceDoorY, buildings);
+        if (sheet == nullptr) {
+            sheet = SheetIdAtTile(loc, kEntranceDoorX, kEntranceDoorY - 1, buildings);
+        }
+        if (sheet == nullptr) {
+            sheet = SheetIdAtTile(loc, kEntranceDoorX, kEntranceDoorY + 1, buildings);
+        }
+        if (sheet == nullptr) {
+            s_entranceDoor = 2;
+            LOGF("elevator: entrance: no tile to read a sheet from, room alone");
+            return;
+        }
+        {
+            char ascii[24];
+            int n = 0;
+            const int len = ManagedStrLen(sheet);
+            for (int i = 0; i < len && i < 22; i++) {
+                const char16_t c = ManagedStrChar(sheet, i);
+                ascii[n++] = (c >= 32 && c < 127) ? static_cast<char>(c) : '?';
+            }
+            ascii[n] = 0;
+            LOGF("elevator: entrance sheet %d '%s'", len, n > 0 ? ascii : "?");
+        }
+        auto setTile = reinterpret_cast<void (*)(void*, int, int, int, void*,
+                                                 void*, int, int)>(
+            g_base + kSetMapTileOff);
+        /* One call per log line, so a hang names the step it died in. */
+        LOGF("elevator: entrance paint bottom");
+        setTile(loc, kEntranceDoorX, kEntranceDoorY, kElevDoorBottom, buildings,
+                sheet, 0, 1);
+        LOGF("elevator: entrance paint bottom ok");
+        setTile(loc, kEntranceDoorX, kEntranceDoorY - 1, kElevDoorMid, front,
+                sheet, 0, 1);
+        LOGF("elevator: entrance paint middle ok");
+        setTile(loc, kEntranceDoorX, kEntranceDoorY - 2, kElevDoorTop, front,
+                sheet, 0, 1);
+        LOGF("elevator: entrance paint top ok");
+        s_elevSpotX = kEntranceDoorX;
+        s_elevSpotY = kEntranceDoorY;
+        s_entranceDoor = 1;
+        LOGF("elevator: entrance door at %d,%d..%d (painted)",
+             kEntranceDoorX, kEntranceDoorY - 2, kEntranceDoorY);
+    }
+
+    void MaybePrepElevator() {
+        if (!kSkullElevator) {
+            return;
+        }
+        /* declared later in the file; same value, one site */
+        void* loc = SafeCurrentLocation();
+        if (loc != s_elevLoc) {
+            s_elevLoc = loc;
+            s_elevSpotX = -1;
+            s_elevSpotY = -1;
+            s_elevPrepLevel = -1;
+            s_elevSrc = 0;
+            s_elevTries = 0;
+            /* v566: clear the name diagnostics with the rest.  v565's panel
+             * was showing 18/Un from an earlier location while the current one
+             * had not been examined at all -- stale evidence that looks exactly
+             * like a real reading. */
+            s_elevNmLen = -1;
+            s_elevNmChar0 = 0;
+            s_elevNmChar1 = 0;
+            s_elevLvlSrc = 0;
+            s_elevRangeOk = 0;
+            s_elevLogged = 0;
+        }
+        /* v573: one line per location, always.  Two builds ended in a crash with
+         * no elevator line at all, and the honest answer to "did the game die
+         * before or after it built the room" was "the log does not say".  This
+         * line says it: the last "loc:" in the file is where the game was. */
+        static void* s_locLogged = nullptr;
+        if (loc != nullptr && loc != s_locLogged) {
+            s_locLogged = loc;
+            void* nm = LocNameStr(loc);
+            char ascii[20];
+            int n = 0;
+            const int len = nm != nullptr ? ManagedStrLen(nm) : -1;
+            for (int i = 0; i < len && i < 18; i++) {
+                const char16_t c = ManagedStrChar(nm, i);
+                ascii[n++] = (c >= 32 && c < 127) ? static_cast<char>(c) : '?';
+            }
+            ascii[n] = 0;
+            LOGF("loc: %s (len %d)", n > 0 ? ascii : "?", len);
+        }
+        if (s_elevSrc != 0 || s_elevTries >= 240) {
+            return;                     /* resolved, or gave up (~4 s) */
+        }
+        /* v572: THE ENTRANCE ROOM IS NOT A MINESHAFT AND IS SMALLER.
+         *
+         * A MineShaft instance is big enough for +0x370; the entrance room is a
+         * plain GameLocation (metadata says instance size 0x308), so the range
+         * check below rejected it before its name was ever read.  That is why
+         * v571 placed no door there and wrote no "elevator:" line at all -- the
+         * only thing v571 changed in that room was the hook, which is also the
+         * one thing that could turn a missing feature into a crash.
+         *
+         * So: name first, then the size check that belongs to the mine path. */
+        if (loc == nullptr || !Plausible(loc) || !RangeReadable(loc, 0x9Cu)) {
+            return;
+        }
+        if (IsSkullCaveLocation(loc)) {
+            s_entranceLoc = loc;      /* v591: the click probe needs this */
+            if (kEntranceElevator) {
+                /* v583: WAIT FOR THE ROOM LIKE THE MINE LEVELS DO.
+                 *
+                 * v582 hung on the black screen right after
+                 * "loc: SkullCave (len 9)" and before any "elevator: entrance"
+                 * line, i.e. inside the first call -- on the frame the room is
+                 * still being built.  The mine path has waited 30 frames since
+                 * v577 for exactly this reason; the entrance path never did. */
+                ++s_elevTries;
+                if (s_elevTries < 30) {
+                    return;
+                }
+                void* map = *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(loc) + 0x98u);
+                if (map == nullptr || !Plausible(map)) {
+                    return;             /* retry once the map is up */
+                }
+                if (s_entranceDoor != 1) {
+                    LOGF("elevator: entrance preparing");
+                }
+                PrepEntranceElevator(loc);
+            }
+            s_elevSrc = kEntranceSrc;
+            s_elevLogged = 1;
+            return;
+        }
+        if (!RangeReadable(loc, 0x370u)) {
+            return;
+        }
+        s_elevRangeOk = 1;
+        if (!IsMineShaftLocation(loc)) {
+            /* v568: the log has to answer what the panel used to.  Only names
+             * that LOOK like a mine are reported ("Un..." / "Sk..."), so walking
+             * around the valley does not fill the file. */
+            if (s_elevLogged == 0 &&
+                ((s_elevNmChar0 == u'U' && s_elevNmChar1 == u'n') ||
+                 (s_elevNmChar0 == u'S' && s_elevNmChar1 == u'k'))) {
+                s_elevLogged = 1;
+                LOGF("elevator: not a shaft: nm=%d %c%c", s_elevNmLen,
+                     (s_elevNmChar0 >= 32 && s_elevNmChar0 < 127)
+                         ? s_elevNmChar0 : '.',
+                     (s_elevNmChar1 >= 32 && s_elevNmChar1 < 127)
+                         ? s_elevNmChar1 : '.');
+            }
+            return;
+        }
+        if (s_elevLogged == 0) {
+            s_elevLogged = 1;
+            LOGF("elevator: shaft nm=%d rg=%d", s_elevNmLen, s_elevRangeOk);
+        }
+        /* v564: the level comes from the NAME, not from netMineLevel.
+         *
+         * v563 read the NetInt through `NetValueSlot(loc, 0x350, 4)` and the
+         * hardware panel showed `lvl=0` with no door and no log line -- what a
+         * failed slot lookup looks like, and that offset was never verified
+         * against IL2CPP metadata.  The name is authoritative anyway:
+         * MineShaft.GetLevelName(level) is "UndergroundMine" + the number, so
+         * parsing it cannot disagree with the level the game actually used. */
+        void* nameSlot = NetValueSlot(loc, kLocNameOff, 8u);
+        void* nameStr = nameSlot != nullptr
+                            ? *reinterpret_cast<void**>(nameSlot)
+                            : nullptr;
+        int level = -1;
+        if (nameStr != nullptr && s_elevNmLen > 15) {
+            int acc = 0;
+            int digits = 0;
+            for (int i = 15; i < s_elevNmLen && digits < 4; ++i) {
+                const char16_t c = ManagedStrChar(nameStr, i);
+                if (c < u'0' || c > u'9') {
+                    break;
+                }
+                acc = acc * 10 + static_cast<int>(c - u'0');
+                ++digits;
+            }
+            if (digits > 0) {
+                level = acc;
+                s_elevLvlSrc = 1;
+            }
+        }
+        s_elevDbgLevel = level > 0 ? level : 0;
+        if (level < 0) {
+            if (s_elevSrc != 6) {
+                s_elevSrc = 6;
+                LOGF("elevator: mine level not in the name (len=%d)", s_elevNmLen);
+            }
+            return;
+        }
+        if (level < 121) {
+            /* v563: say it once per level, so a report proves the mod sees the
+             * mine at all.  Before the name fix nothing here ever ran, which is
+             * why "no elevator in the Skull Cavern" had an empty log. */
+            if (s_elevSrc != 5) {
+                s_elevSrc = 5;
+                LOGF("elevator: level %d is the valley mine, left alone", level);
+            }
+            return;
+        }
+        /* the desert mine's first floor, and every fifth one after it */
+        if (level != 121 && (level % 5) != 0) {
+            s_elevSrc = 3;
+            return;
+        }
+        ++s_elevTries;
+        void* map = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(loc) + 0x98u);
+        if (map == nullptr || !Plausible(map)) {
+            return;                     /* retry once the map is up */
+        }
+        /* v577: and let the level finish loading before writing into its map.
+         * v576 crashed inside setMapTile on the first frame the map pointer was
+         * non-null, which is the frame the location is still being built. */
+        /* v586: 10 frames, not 30.  The wait exists so setMapTile never runs
+         * while the level is still being built (v576 crashed doing exactly
+         * that); 30 frames were chosen with no measurement and read as "the
+         * door pops in a moment after the screen comes back".  10 still leaves
+         * the map fully built -- if a crash comes back, this is the knob. */
+        if (s_elevTries < 10) {
+            return;
+        }
+
+        /* v575: DO NOT CALL prepareElevator().
+         *
+         * v574's log ends on "elevator: prep lvl=121" and the screen stays black
+         * from there, so the game's own routine is what hangs.  It was never
+         * meant to run for area 121, and it ends in updateMineLevelData(), mine
+         * bookkeeping this location never went through.  Painting the door needs
+         * one write, so do that write directly and leave the rest of the mine
+         * alone.
+         *
+         * Everything is logged BEFORE the call it protects, so the next hang (if
+         * any) names the exact step. */
+        void* ladderPt = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(loc) + kMineLadderOff);
+        if (ladderPt == nullptr || !Plausible(ladderPt) ||
+            !RangeReadable(reinterpret_cast<unsigned char*>(ladderPt) + 0x68u, 8u)) {
+            s_elevSrc = 4;
+            LOGF("elevator: level %d has no ladder", level);
+            return;
+        }
+        /* v576: netTileBeneathLadder is a NetVECTOR2, not a NetPoint.
+         *
+         * v575 read it as two ints and logged (1084227584, 1082130432) -- those
+         * are the bit patterns of 5.0f and 4.0f, i.e. the ladder at tile (5,4).
+         * The decompiled field list says NetVector2, so read two floats. */
+        const float fx = *reinterpret_cast<const float*>(
+            reinterpret_cast<unsigned char*>(ladderPt) + 0x68u);
+        const float fy = *reinterpret_cast<const float*>(
+            reinterpret_cast<unsigned char*>(ladderPt) + 0x6Cu);
+        const int lx = static_cast<int>(fx + 0.5f);
+        const int ly = static_cast<int>(fy + 0.5f);
+        if (!(fx >= -1.0f && fx <= 200.0f && fy >= -1.0f && fy <= 200.0f) ||
+            lx < 0 || ly < 0 || lx > 79 || ly > 63) {
+            s_elevSrc = 4;
+            /* tenths, because %f is not linked into this image */
+            LOGF("elevator: level %d ladder unknown (%d,%d tenths)", level,
+                 static_cast<int>(fx * 10.0f), static_cast<int>(fy * 10.0f));
+            return;
+        }
+        void* buildings = nullptr;
+        void* front = nullptr;
+        if (!BuildLayerNames(loc, &buildings, &front)) {
+            s_elevSrc = 4;
+            LOGF("elevator: could not build the layer names");
+            return;
+        }
+        /* v592: follow the PC mod exactly.
+         *
+         * It scans the Buildings layer for tile 115 (the down-ladder) and paints
+         *   x = ladder.x + 1,  bottom = ladder.y,  middle = y-1,  top = y-2
+         * which is why its door always sits flush against the wall's right edge
+         * of the ladder.  We used netTileBeneathLadder + x-1 and got a door that
+         * was right on some level shapes and two tiles off on others. */
+        int gx = -1;
+        int gy = -1;
+        int gt = -1;
+        void* ladderSheet = nullptr;
+        if (!BuildSheetId(loc, &ladderSheet)) {
+            LOGF("elevator: no sheet id for the ladder scan");
+        }
+        if (!FindLadderTile(loc, buildings, ladderSheet, &gx, &gy, &gt)) {
+            gx = lx;
+            gy = ly;
+            LOGF("elevator: no ladder tile, using the field (%d,%d)", lx, ly);
+        }
+        else {
+            LOGF("elevator: ladder tile %d at %d,%d", gt, gx, gy);
+        }
+        const int sy = gy;
+        /* v595: DON'T ALWAYS PAINT TO THE RIGHT.
+         *
+         * The PC mod hardcodes x+1, and on the level shapes where the ladder
+         * stands against the RIGHT edge of the cave that puts the door half
+         * inside the rock and half in the black outside the map -- the level
+         * 125 screenshot (ladder at 9,30, door at 10,28..30) shows exactly
+         * that: still clickable, but it reads as a door cut into the wall.
+         *
+         * So probe both cells before painting: the side whose wall face and
+         * floor are both really there wins, and the right side is kept when
+         * neither side is clean (that is what every build up to v594 did, so
+         * a probe that cannot see anything costs nothing).
+         *
+         * v596: the first version of this probe read the Back layer only and
+         * the hardware log came back with r=7 l=7 / r=3 l=3 / r=15 l=15 --
+         * the wall face is a FRONT tile, so the middle and top rows scored 0
+         * on good levels and no door ever moved.  ProbeSide now asks Back for
+         * the ground and Front for the face. */
+        int sx = (gx + 1 <= 79) ? (gx + 1) : (gx - 1);
+        {
+            static const char16_t kBack[4] = {u'B', u'a', u'c', u'k'};
+            void* back = nullptr;
+            if (ladderSheet == nullptr || !BuildAsciiStr(loc, kBack, 4, &back) ||
+                back == nullptr) {
+                LOGF("elevator: no back layer to probe, right side as before");
+            }
+            else {
+                int bR = 0, fR = 0, iR = -1;
+                int bL = 0, fL = 0, iL = -1;
+                ProbeSide(loc, back, front, ladderSheet, sx, sy, &bR, &fR, &iR);
+                const int lx2 = gx - 1;
+                if (lx2 >= 0) {
+                    ProbeSide(loc, back, front, ladderSheet, lx2, sy, &bL, &fL,
+                              &iL);
+                }
+                /* v596: Back mask / Front mask / the Back index of the bottom
+                 * row.  The index is what tells "empty" (-1) apart from "a
+                 * black tile that happens to fill the map" (0..n) if the next
+                 * report still shows a door hanging in the dark. */
+                LOGF("elevator: side r=%d/%d#%d l=%d/%d#%d -> %d,%d",
+                     bR, fR, iR, bL, fL, iL, sx, sy);
+                if (lx2 >= 0 && !SideLooksSolid(bR, fR) &&
+                    SideLooksSolid(bL, fL)) {
+                    sx = lx2;       /* the ladder hugs the right-hand wall */
+                }
+            }
+        }
+        LOGF("elevator: ladder %d,%d, painting %d,%d..%d", lx, ly, sx, sy - 2,
+             sy);
+        auto setTile = reinterpret_cast<void (*)(void*, int, int, int, void*,
+                                                 void*, int, int)>(
+            g_base + kSetMapTileOff);
+        /* The three tiles are the vanilla mine's door, copied into free slots of
+         * the desert sheets (romfs): 189 = bottom (112), 136 = middle (96),
+         * 135 = top (80).  Bottom on Buildings, the two above on Front, exactly
+         * like the PC mod.  tileSheetId is null so the layer's own sheet is
+         * used. */
+        void* sheet = nullptr;
+        if (!BuildSheetId(loc, &sheet)) {
+            s_elevSrc = 4;
+            LOGF("elevator: could not build the sheet id");
+            return;
+        }
+        setTile(loc, sx, sy, kElevDoorBottom, buildings, sheet, 0, 1);
+        LOGF("elevator: t1 ok");
+        setTile(loc, sx, sy - 1, kElevDoorMid, front, sheet, 0, 1);
+        LOGF("elevator: t2 ok");
+        setTile(loc, sx, sy - 2, kElevDoorTop, front, sheet, 0, 1);
+        LOGF("elevator: t3 ok");
+        LOGF("elevator: painted (%d,%d..%d)", sx, sy - 2, sy);
+        s_elevSpotX = sx;
+        s_elevSpotY = sy;
+        s_elevPrepLevel = level;
+        s_elevSrc = 2;
+        LOGF("elevator: level %d door at %d,%d (placed)", level, sx, sy);
+    }
+
+    /* Is the tile the player is interacting with the elevator door we lit on
+     * this floor?  Tile 112 is vanilla's own elevator tile, kept as a
+     * fallback; the ladder is no longer hijacked now that the door exists. */
+    bool SkullElevatorWanted(void* shaft, int tx, int ty) {
+        /* v566: 0x370, not 0x390 -- see the note in MaybePrepElevator. */
+        if (!RangeReadable(shaft, 0x370u)) {
+            return false;
+        }
+        /* v596: the door is THREE tiles tall -- take a click anywhere on it.
+         *
+         * Only the bottom row used to answer, so on the levels where the door
+         * ends up at the edge of the lit area the player had to hit one exact
+         * tile that is half hidden by the rock -- "还是能用，就是位置刁钻、不好点".
+         * The middle and top tiles are ours alone (nothing else of ours is
+         * painted there), so widening cannot swallow a vanilla interaction. */
+        if (s_elevSpotX >= 0 && tx == s_elevSpotX &&
+            ty >= s_elevSpotY - 2 && ty <= s_elevSpotY) {
+            return true;
+        }
+        /* v594: same three-argument call the scan needs (Location, layer,
+         * sheet).  With only two the leftover register made this path die as
+         * soon as the player clicked a tile that was not our door. */
+        void* buildings = nullptr;
+        void* front = nullptr;
+        void* sheet = nullptr;
+        if (!BuildLayerNames(shaft, &buildings, &front) ||
+            !BuildSheetId(shaft, &sheet)) {
+            return false;
+        }
+        auto tileAt = reinterpret_cast<int (*)(void*, long, void*, void*)>(
+            g_base + kTileIndexAtOff);
+        const long pt = static_cast<long>(static_cast<unsigned>(tx)) |
+                        (static_cast<long>(static_cast<unsigned>(ty)) << 32);
+        return tileAt(shaft, pt, buildings, sheet) == 112;
+    }
+
+    bool HookMineCheckAction(void* self, long loc, long vp0, long vp1, void* who) {
+
+        HIT_NO_WORLD(minecheckaction);
+        if (kSkullElevator && self != nullptr && Plausible(self)) {
+            const int tx = static_cast<int>(loc & 0xFFFFFFFFLL);
+            const int ty = static_cast<int>(
+                static_cast<unsigned long long>(loc) >> 32);
+            if (SkullElevatorWanted(self, tx, ty)) {
+                void* slot = reinterpret_cast<void*>(g_base + kGame1MenuOff);
+                if (RangeReadable(slot, 8u)) {
+                    void* menu = NewSkullElevatorMenu();
+                    if (menu != nullptr) {
+                        /* Root it before the relabel allocates (v224 rule). */
+                        *reinterpret_cast<void**>(slot) = menu;
+                        const int labels = RelabelSkullElevatorMenu(menu, self);
+                        if (labels < 0) {
+                            /* Half-labelled would warp into the valley mine. */
+                            *reinterpret_cast<void**>(slot) = nullptr;
+                            LOGF("elevator: button list unreadable, closed again");
+                        }
+                        else {
+                            LOGF("elevator: opened for tile %d,%d (%d labels)",
+                                 tx, ty, labels);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        if (s_origMineCheckAction != nullptr) {
+            return s_origMineCheckAction(self, loc, vp0, vp1, who);
+        }
+        return false;
+    }
+
+    /* v571: the entrance room's door.  GameLocation.checkAction is the base
+     * every non-mine location falls through to (MineShaft has its own override
+     * and never reaches here), so the hook only has to recognise our own room
+     * and our own door tile; everything else is forwarded untouched.
+     *
+     * v600: the address below is finally the right one -- see the note on
+     * kLocCheckActionOff.  v571..v599 hooked Game1.set_activeClickableMenu by
+     * mistake, so this function has never once run on a tile click. */
+    using LocCheckActionFn = bool (*)(void*, long, long, long, void*);
+    static LocCheckActionFn s_origLocCheckAction = nullptr;
+
+    bool HookLocCheckAction(void* self, long loc, long vp0, long vp1, void* who) {
+
+        HIT_NO_WORLD(loccheckaction);
+        /* v600: three lines of proof that the hook is live, then silent.  A
+         * report of "the painted door still does nothing" is two very different
+         * bugs depending on whether these lines exist: if they do, the click
+         * reaches checkAction and the tile test is wrong; if they do not, the
+         * press never became a checkAction at all and the next address to try
+         * is Game1.pressActionButton.  Three lines is cheap enough to keep. */
+        static int s_locHookHits = 0;
+        if (s_locHookHits < 3) {
+            ++s_locHookHits;
+            LOGF("elevator: lochook %d self=%p entrance=%p", s_locHookHits,
+                 self, s_entranceLoc);
+        }
+        /* v591 note, still true: installing this base-class hook was once
+         * blamed for a crash, and later builds crashed without one, so the
+         * blame was never proven.  Everything unmatched here is forwarded
+         * untouched -- the only thing this adds is one log line naming the
+         * clicked tile, plus the menu when the tile is our own door. */
+        if (self != nullptr && self == s_entranceLoc) {
+            const int tx = static_cast<int>(loc & 0xFFFFFFFFLL);
+            const int ty = static_cast<int>(
+                static_cast<unsigned long long>(loc) >> 32);
+            LOGF("elevator: entrance click %d,%d", tx, ty);
+        }
+        if (s_entranceDoor == 1 && self == s_entranceLoc) {
+            const int tx = static_cast<int>(loc & 0xFFFFFFFFLL);
+            const int ty = static_cast<int>(
+                static_cast<unsigned long long>(loc) >> 32);
+            /* v599: the door is the three painted rows, bottom at s_elevSpotY
+             * on the column's own footing row.  Take all three, the same window
+             * the mine's door uses -- a one-tile target in a dark corner is what
+             * the user called awkward to hit.
+             *
+             * v600: and one row BELOW the door as well.  The player stands on
+             * the floor at (8,5) and faces the door; depending on where the
+             * pointer lands, checkAction can arrive with the floor tile under
+             * the door rather than one of its three rows.  That floor cell has
+             * no vanilla interaction of its own, so accepting it takes nothing
+             * away -- and it is the most likely aim if the door itself is what
+             * refused to answer in v599. */
+            if (tx == s_elevSpotX && ty >= s_elevSpotY - 2 &&
+                ty <= s_elevSpotY + 1) {
+                void* slot = reinterpret_cast<void*>(g_base + kGame1MenuOff);
+                if (RangeReadable(slot, 8u)) {
+                    void* menu = NewSkullElevatorMenu();
+                    if (menu != nullptr) {
+                        *reinterpret_cast<void**>(slot) = menu;
+                        const int labels = RelabelSkullElevatorMenu(menu, self);
+                        if (labels < 0) {
+                            *reinterpret_cast<void**>(slot) = nullptr;
+                            LOGF("elevator: entrance menu unreadable, closed again");
+                        }
+                        else {
+                            LOGF("elevator: entrance opened at %d,%d (%d labels)",
+                                 tx, ty, labels);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        if (s_origLocCheckAction != nullptr) {
+            return s_origLocCheckAction(self, loc, vp0, vp1, who);
+        }
+        return false;
+    }
+
+    /* v601: the menu's floor entry, "0".
+     *
+     * Both menus (the one on a mine level and the one in the entrance room) are
+     * vanilla MineElevatorMenu, so the click handler is vanilla too:
+     *     Convert.ToInt32(button.name) -> Game1.enterMine(level)
+     * The floor button therefore has to carry a number, and 0 is the one value
+     * that never means a real depth here -- MineShaft levels start at 1, the
+     * desert mine at 121.  So: rewrite button 0's name to "000" and catch the
+     * call.  Vanilla's own enterMine(0) -- walking into the valley mine from the
+     * mountain -- must keep working, which is why the divert is gated on the
+     * CURRENT location really being a desert shaft.
+     *
+     * Reading the depth from the current location instead of reusing
+     * s_elevDbgLevel matters: that variable keeps its last value after the
+     * player leaves the mine, so a later enterMine(0) at the mountain entrance
+     * would have been mistaken for a menu click and warped into the desert. */
+    int CurrentSkullDepth() {
+        void* loc = SafeCurrentLocation();
+        if (loc == nullptr || !Plausible(loc) || !RangeReadable(loc, 0x9Cu)) {
+            return -1;
+        }
+        void* str = LocNameStr(loc);
+        if (str == nullptr) {
+            return -1;
+        }
+        const int len = ManagedStrLen(str);
+        if (len < 16 || len > 24) {
+            return -1;
+        }
+        if (ManagedStrChar(str, 0) != u'U' ||
+            ManagedStrChar(str, 1) != u'n') {
+            return -1;
+        }
+        int acc = 0;
+        int digits = 0;
+        for (int i = 15; i < len && digits < 4; ++i) {
+            const char16_t c = ManagedStrChar(str, i);
+            if (c < u'0' || c > u'9') {
+                break;
+            }
+            acc = acc * 10 + static_cast<int>(c - u'0');
+            ++digits;
+        }
+        return digits > 0 ? acc : -1;
+    }
+
+    using EnterMineFn = void (*)(long, void*);
+    static EnterMineFn s_origEnterMine = nullptr;
+
+    /* (long, void*) rather than (int): the body saves x1 on the way in and hands
+     * it to the string builder that makes "UndergroundMine<level>", so x1 is
+     * forwarded untouched instead of being dropped. */
+    void HookEnterMine(long p0, void* p1) {
+
+        HIT_NO_WORLD(entermine);
+        const int level = static_cast<int>(p0 & 0xFFFFFFFFLL);
+        if (kSkullElevator && level == 0 && s_entranceLoc != nullptr &&
+            CurrentSkullDepth() >= 121) {
+            /* The room's own name string: no allocation, no length rule, and it
+             * is the exact object the game uses as its key. */
+            void* room = LocNameStr(s_entranceLoc);
+            if (room != nullptr && Plausible(room)) {
+                /* Vanilla's click handler sets Farmer.ridingMineElevator = true
+                 * on the line before it calls enterMine, and enterMine is what
+                 * normally plays that out and clears it again.  This path skips
+                 * enterMine entirely, so clear the flag by hand or the farmer
+                 * stays "in the elevator" after the warp.
+                 *
+                 * 0x4A0 is a plain bool, not a reference: its type token is the
+                 * same one canMove (0x640) and running (0x641) carry, and those
+                 * sit one byte apart. */
+                void* pl = reinterpret_cast<void* (*)(void*)>(
+                    g_base + kGetPlayerOff)(nullptr);
+                if (pl != nullptr && Plausible(pl) &&
+                    RangeReadable(
+                        reinterpret_cast<unsigned char*>(pl) + 0x4A0u, 1u)) {
+                    *reinterpret_cast<unsigned char*>(
+                        reinterpret_cast<unsigned char*>(pl) + 0x4A0u) = 0;
+                }
+                constexpr uintptr_t kWarpOff = SDV_OFF(kWarpOff, 0x1474BE0u);
+                /* (name, tileX, tileY, facingDirectionAfterWarp, isStructure) --
+                 * the same signature enterMine itself uses at 0x1477B40, where
+                 * it passes (name, 6, 6, 2, 1).  7,8 is where the Desert's own
+                 * warp ("8 5 SkullCave 7 8") drops the player. */
+                reinterpret_cast<void (*)(void*, int, int, int, int)>(
+                    g_base + kWarpOff)(room, 7, 8, 0, 0);
+                LOGF("elevator: menu 0 -> SkullCave 7,8");
+                return;
+            }
+            LOGF("elevator: menu 0 has no room name, vanilla path");
+        }
+        if (s_origEnterMine != nullptr) {
+            s_origEnterMine(p0, p1);
+        }
+    }
+
+    /* v602: the real "0" button path (see kMineWarpOff).
+     *
+     * 1.6 sends button 0 straight to warpFarmer("Mine", 17, 4, ...), so the
+     * enterMine hook above is only a fallback.  Sitting on this overload of
+     * warpFarmer is safe because the divert needs ALL of:
+     *   - the name really is "Mine" (length 4, M/i/n/e -- no managed compare),
+     *   - the tile pair is the constant (17,4) the button hard-codes,
+     *   - the location the player is standing in RIGHT NOW is UndergroundMine<>=121.
+     * Anything else -- including the ordinary valley mine's own elevator, where
+     * the current location is UndergroundMine1..120 -- is forwarded untouched.
+     * w4 is the isStructure flag (getLocationFromName is called with a literal
+     * 0 inside this overload), so the replacement asks for a plain location. */
+    using MineWarpFn = void (*)(void*, int, int, int, int);
+    static MineWarpFn s_origMineWarp = nullptr;
+
+    void HookMineWarp0(void* name, int tileX, int tileY, int a, int b) {
+
+        HIT_NO_WORLD(minewarp0);
+        if (name != nullptr && tileX == 17 && tileY == 4 &&
+            s_entranceLoc != nullptr && CurrentSkullDepth() >= 121 &&
+            ManagedStrLen(name) == 4 && ManagedStrChar(name, 0) == u'M' &&
+            ManagedStrChar(name, 1) == u'i' &&
+            ManagedStrChar(name, 2) == u'n' &&
+            ManagedStrChar(name, 3) == u'e') {
+            void* room = LocNameStr(s_entranceLoc);
+            if (room != nullptr && Plausible(room)) {
+                if (s_origMineWarp != nullptr) {
+                    s_origMineWarp(room, 7, 8, a, 0);
+                }
+                LOGF("elevator: menu 0 -> SkullCave 7,8");
+                return;
+            }
+            LOGF("elevator: menu 0 has no room name, vanilla path");
+        }
+        if (s_origMineWarp != nullptr) {
+            s_origMineWarp(name, tileX, tileY, a, b);
+        }
     }
 
     void ShipGroupLeftovers(void* here, void* pl) {
-        if (s_regBinCount == 0 || here == nullptr || pl == nullptr) {
+        if (here == nullptr || pl == nullptr) {
             return;
         }
         void* farm = reinterpret_cast<void* (*)(void*)>(g_base + kGame1GetFarmOff)(
@@ -15602,130 +18619,162 @@ namespace {
              * purpose (its bin is a different location object). */
             return;
         }
-        void* tfDict = TerrainDict();
+        constexpr int kShipMax = 96;
+        int sold = 0;
 
-        /* v522: paths/floors connect the bin exactly like they connect machines.
+        /* v535: every sell box trims itself by the ratio (see TrimSellBoxes).
+         * 0 % keeps everything, 100 % sells everything that arrives. */
+        TrimSellBoxes(farm, pl);
+        const int fromBox = sold;
+
+        /* v1.11 rule, narrowed in v523: a chest touching the bin (or a path
+         * that reaches it) still ships everything it holds, but only when no
+         * machine shares its group.
          *
          * The walk is seeded with the bin's footprint and its one-tile ring (the
          * ring is what makes plain adjacency work), then every connector tile
-         * extends it.  A registered chest that touches any visited tile -- the
-         * ring, a path tile, or a path tile further out -- is shipped.
-         *
-         * The wire test shares its terrain-lookup budget with the machine
-         * groups, so during a rebuild pass this walk may spend at most 48
-         * lookups; every other pass is cache-only and costs nothing. */
-        constexpr int kShipWalkMax = 128;
-        static int walk[kShipWalkMax];
-        int walkN = 0;
-        for (int b = 0; b < s_regBinCount; ++b) {
-            const int x0 = s_regBinX[b];
-            const int y0 = s_regBinY[b];
-            const int w = s_regBinW[b];
-            const int h = s_regBinH[b];
-            for (int y = y0 - 1; y <= y0 + h; ++y) {
-                for (int x = x0 - 1; x <= x0 + w; ++x) {
-                    if (walkN < kShipWalkMax) {
-                        walk[walkN++] = PackTile(static_cast<float>(x),
-                                                 static_cast<float>(y));
+         * extends it.  The wire test shares its terrain-lookup budget with the
+         * machine groups, so during a rebuild pass this walk may spend at most
+         * 48 lookups; every other pass is cache-only and costs nothing. */
+        if (s_regBinCount > 0) {
+            void* tfDict = TerrainDict();
+            constexpr int kShipWalkMax = 128;
+            static int walk[kShipWalkMax];
+            int walkN = 0;
+            for (int b = 0; b < s_regBinCount; ++b) {
+                const int x0 = s_regBinX[b];
+                const int y0 = s_regBinY[b];
+                const int w = s_regBinW[b];
+                const int h = s_regBinH[b];
+                for (int y = y0 - 1; y <= y0 + h; ++y) {
+                    for (int x = x0 - 1; x <= x0 + w; ++x) {
+                        if (walkN < kShipWalkMax) {
+                            walk[walkN++] = PackTile(static_cast<float>(x),
+                                                     static_cast<float>(y));
+                        }
                     }
                 }
             }
-        }
-        int scans = s_connScan ? 48 : 0;
-        for (int i = 0; i < walkN; ++i) {
-            const int ax = static_cast<int>(
-                (static_cast<unsigned>(walk[i]) >> 16) & 0xFFFFu);
-            const int ay = static_cast<int>(
-                static_cast<unsigned>(walk[i]) & 0xFFFFu);
-            static const int ddx[4] = {1, -1, 0, 0};
-            static const int ddy[4] = {0, 0, 1, -1};
-            for (int d = 0; d < 4 && walkN < kShipWalkMax; ++d) {
-                const int nx = ax + ddx[d];
-                const int ny = ay + ddy[d];
-                const int key = PackTile(static_cast<float>(nx),
-                                         static_cast<float>(ny));
-                bool seen = false;
-                for (int k = 0; k < walkN && !seen; ++k) {
-                    seen = (walk[k] == key);
-                }
-                if (seen) {
-                    continue;
-                }
-                if (s_connScan) {
-                    if (scans <= 0) {
-                        continue;           /* budget spent for this pass */
+            int scans = s_connScan ? 48 : 0;
+            for (int i = 0; i < walkN; ++i) {
+                const int ax = static_cast<int>(
+                    (static_cast<unsigned>(walk[i]) >> 16) & 0xFFFFu);
+                const int ay = static_cast<int>(
+                    static_cast<unsigned>(walk[i]) & 0xFFFFu);
+                static const int ddx[4] = {1, -1, 0, 0};
+                static const int ddy[4] = {0, 0, 1, -1};
+                for (int d = 0; d < 4 && walkN < kShipWalkMax; ++d) {
+                    const int nx = ax + ddx[d];
+                    const int ny = ay + ddy[d];
+                    const int key = PackTile(static_cast<float>(nx),
+                                             static_cast<float>(ny));
+                    bool seen = false;
+                    for (int k = 0; k < walkN && !seen; ++k) {
+                        seen = (walk[k] == key);
                     }
-                    --scans;
-                }
-                if (ConnectorAt(tfDict, static_cast<float>(nx),
-                                static_cast<float>(ny))) {
-                    walk[walkN++] = key;
-                }
-            }
-        }
-
-        auto shipItem = reinterpret_cast<void (*)(void*, void*, void*)>(
-            g_base + kFarmShipItemOff);
-        auto getItems = reinterpret_cast<void* (*)(void*)>(g_base + kChestGetItemsOff);
-        auto getCount = reinterpret_cast<int (*)(void*)>(g_base + kInvCountOff);
-        auto getItem = reinterpret_cast<void* (*)(void*, int)>(g_base + kInvGetItemOff);
-        auto setItem = reinterpret_cast<void (*)(void*, int, void*)>(g_base + kInvSetItemOff);
-        auto category = reinterpret_cast<int (*)(void*)>(
-            g_base + kShipItemCategoryOff);
-        int shipped = 0;
-        for (int i = 0; i < walkN && shipped < 96; ++i) {
-            const int ax = static_cast<int>(
-                (static_cast<unsigned>(walk[i]) >> 16) & 0xFFFFu);
-            const int ay = static_cast<int>(
-                static_cast<unsigned>(walk[i]) & 0xFFFFu);
-            for (int c = 0; c < s_regChestCount && shipped < 96; ++c) {
-                const int cx = static_cast<int>(s_regChestX[c]);
-                const int cy = static_cast<int>(s_regChestY[c]);
-                if (cx < ax - 1 || cx > ax + 1 || cy < ay - 1 || cy > ay + 1) {
-                    continue;
-                }
-                void* chest = s_regChests[c];
-                if (chest == nullptr || !Plausible(chest)) {
-                    continue;
-                }
-                void* inv = getItems(chest);
-                if (inv == nullptr || !Plausible(inv)) {
-                    continue;
-                }
-                const int n = getCount(inv);
-                for (int s = 0; s < n && shipped < 96; ++s) {
-                    void* item = getItem(inv, s);
-                    if (item == nullptr || !Plausible(item)) {
+                    if (seen) {
                         continue;
                     }
-                    if (category(item) <= -96) {
-                        continue;           /* equipment stays in the chest */
+                    if (s_connScan) {
+                        if (scans <= 0) {
+                            continue;       /* budget spent for this pass */
+                        }
+                        --scans;
                     }
-                    shipItem(farm, item, pl);
-                    setItem(inv, s, nullptr);
-                    ++shipped;
+                    if (ConnectorAt(tfDict, static_cast<float>(nx),
+                                    static_cast<float>(ny))) {
+                        walk[walkN++] = key;
+                    }
+                }
+            }
+
+            for (int i = 0; i < walkN && sold < kShipMax; ++i) {
+                const int ax = static_cast<int>(
+                    (static_cast<unsigned>(walk[i]) >> 16) & 0xFFFFu);
+                const int ay = static_cast<int>(
+                    static_cast<unsigned>(walk[i]) & 0xFFFFu);
+                for (int c = 0; c < s_regChestCount && sold < kShipMax; ++c) {
+                    const int cx = static_cast<int>(s_regChestX[c]);
+                    const int cy = static_cast<int>(s_regChestY[c]);
+                    if (cx < ax - 1 || cx > ax + 1 || cy < ay - 1 || cy > ay + 1) {
+                        continue;
+                    }
+                    if (s_regChestMach[c] != 0) {
+                        continue;       /* v523: this chest feeds a machine */
+                    }
+                    if (IsSellBox(s_regChests[c])) {
+                        /* v527 FIX -- this is why 50 % still sold everything.
+                         * An auto sell box standing next to the bin (or wired to
+                         * it by a path) was drained HERE, and this loop knows
+                         * nothing about the keep ratio.  The box is owned by the
+                         * dedicated pass above, which honours the ratio; the
+                         * legacy rule must not touch it at any ratio. */
+                        continue;
+                    }
+                    sold += ShipChestItems(farm, pl, s_regChests[c],
+                                           kShipMax - sold);
                 }
             }
         }
-        if (shipped > 0 && s_autoOutput < 0xFu) {
+        if (sold > 0 && s_autoOutput < 0xFu) {
             ++s_autoOutput;
         }
-        if (s_v521Ship < 4u) {
-            ++s_v521Ship;
-            LOGF("v522 ship: %d item(s), bins=%d walk=%d chests=%d", shipped,
-                 s_regBinCount, walkN, s_regChestCount);
+        if (s_v523Ship < 4u) {
+            ++s_v523Ship;
+            LOGF("v523 ship: %d item(s), sell box %d, bins=%d chests=%d",
+                 sold, fromBox, s_regBinCount, s_regChestCount);
         }
     }
 
     void RunAutomation() {
         s_dbgRegChests = static_cast<unsigned>(s_regChestCount);
+        /* v529 DIAG: nearest registered chest's colour fields. */
+        s_dbgChestTint = 0u;
+        s_dbgChestPick = 0u;
+        s_dbgSellCount = 0u;
+        if (s_regChestCount > 0) {
+            void* plDiag = CarryPlayer();
+            if (plDiag != nullptr) {
+                auto tileX = reinterpret_cast<int (*)(void*)>(g_base + kCharTileXOff);
+                auto tileY = reinterpret_cast<int (*)(void*)>(g_base + kCharTileYOff);
+                const int px = tileX(plDiag);
+                const int py = tileY(plDiag);
+                int best = -1;
+                int bestD = 1 << 30;
+                for (int c = 0; c < s_regChestCount; ++c) {
+                    int dx = static_cast<int>(s_regChestX[c]) - px;
+                    int dy = static_cast<int>(s_regChestY[c]) - py;
+                    if (dx < 0) { dx = -dx; }
+                    if (dy < 0) { dy = -dy; }
+                    if (dx + dy < bestD) {
+                        bestD = dx + dy;
+                        best = c;
+                    }
+                }
+                if (best >= 0) {
+                    void* pick = NetValueSlot(s_regChests[best],
+                                              kChestColorPickOff, 4u);
+                    void* tint = NetValueSlot(s_regChests[best],
+                                              kChestColorTintOff, 4u);
+                    s_dbgChestPick = (pick != nullptr)
+                        ? *reinterpret_cast<unsigned*>(pick) : 0xDEADBEEFu;
+                    s_dbgChestTint = (tint != nullptr)
+                        ? *reinterpret_cast<unsigned*>(tint) : 0xDEADBEEFu;
+                }
+                for (int c = 0; c < s_regChestCount; ++c) {
+                    if (IsSellBox(s_regChests[c])) {
+                        ++s_dbgSellCount;
+                    }
+                }
+            }
+        }
         s_dbgRegMachines = static_cast<unsigned>(s_regMachineCount);
 
         /* v359: the wire set.  Decided first, before any early return, so
          * s_connScan can never be left true from a pass that bailed out --
          * that would let a later pass spend lookups without a fresh budget. */
         void* tfDict = TerrainDict();
-        void* locNow = reinterpret_cast<void* (*)()>(g_base + kGame1CurrentLocOff)();
+        void* locNow = SafeCurrentLocation();
         if (tfDict != nullptr &&
             (locNow != s_connLoc || s_connPass >= kConnRebuild)) {
             s_connLoc = locNow;
@@ -15918,6 +18967,7 @@ namespace {
                 }
                 void* machine = s_grpMachines[m];
                 if (NetObjValue(machine, kObjHeldOff) != nullptr) {
+                    ++s_feedBusy;
                     continue;
                 }
                 if (IsTapperBySprite(machine)) {
@@ -15948,6 +18998,19 @@ namespace {
          * take are never sold. */
         ShipGroupLeftovers(locNow, pl);
 
+        if (kAutomateLog && (s_feedOk || s_feedTry || s_feedBusy)) {
+            /* sdlog11: one exact line per pass that touched the feed path.
+             * A pass with a success is always printed; a pass where everything
+             * failed is printed every 32nd time, because a steady stream of
+             * "ok=0" would otherwise cost more log than it is worth. */
+            if (s_feedOk || (++s_feedQuiet % 32u) == 0u) {
+                LOGF("auto: feed ok=%u try=%u busy=%u",
+                     s_feedOk, s_feedTry, s_feedBusy);
+            }
+            s_feedOk = 0;
+            s_feedTry = 0;
+            s_feedBusy = 0;
+        }
         if (kAutomateLog) {
             LOGF("auto: pass end");
         }
@@ -15966,8 +19029,12 @@ namespace {
         if (s_collecting) {
             s_collecting = false;
             TraceIdle(0x11u);
-            if (kAutomateLog) {
-                LOGF("auto: run c=%d m=%d", s_regChestCount, s_regMachineCount);
+            if (kAutomateLog &&
+                (s_regChestCount != 0 || s_regMachineCount != 0 ||
+                 (s_autoHb % 32u) == 0u)) {
+                /* Quiet passes are summarised by the heartbeat instead of
+                 * printing "c=0 m=0" every eight frames. */
+                LOGL("auto: run c=%d m=%d", s_regChestCount, s_regMachineCount);
             }
             /* v352 bisect: the crash now reproduces within seconds of entering
              * the cellar, so the split can be cheap.  This build still harvests
@@ -15990,15 +19057,31 @@ namespace {
             /* Written BEFORE the object walk of the next frame.  If the log
              * ends on this line the crash was inside the walk (our harvest
              * hook); if it ends on "pass end" it was in the game's own update
-             * after us; if it ends on "run"/"out"/"in" it was in RunAutomation. */
-            if (kAutomateLog) {
-                LOGF("auto: hb %u", ++s_autoHb);
+             * after us; if it ends on "run"/"out"/"in" it was in RunAutomation.
+             *
+             * v633: the heartbeat is NOT behind kAutomateLog any more.  It is
+             * one line every ~4 seconds -- cheap enough to keep always -- and
+             * it is the only evidence of "was the main thread alive" left when
+             * a freeze kills the console: v630's log was 7 lines and the whole
+             * diagnosis rested on hb going 96 -> 128.  The per-frame "auto:
+             * run" lines stay behind the switch: those are 120 SD writes a
+             * second, which is what v632 turned off. */
+            {
+                /* One heartbeat roughly every four seconds instead of every
+                 * eight frames.  The counter keeps counting so the gap between
+                 * two logged numbers still tells how much ran unlogged. */
+                const unsigned hb = ++s_autoHb;
+                if ((hb % 32u) == 0u) {
+                    LOGL("auto: hb %u", hb);
+                }
             }
         }
     }
 
     /* ---- Chest.updateWhenCurrentLocation(this, gameTime) ---- */
     void HookChestUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(chestupdate);
         if (AutomateOn() && s_collecting && self != nullptr && IsPlainChest(self)) {
             RegAddChest(self);
         }
@@ -16034,6 +19117,8 @@ namespace {
 
     /* ---- FishPond.Update(this, gameTime) ---- */
     void HookFishPondUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(fishpondupdate);
         if (AutomateOn() && s_collecting && self != nullptr) {
             RegAddPond(self);
         }
@@ -16128,6 +19213,8 @@ namespace {
     }
 
     void HookJunimoHutUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(junimohutupdate);
         if (AutomateOn() && s_collecting && self != nullptr) {
             RegAddHut(self);
         }
@@ -16199,6 +19286,8 @@ namespace {
     /* ---- Object.updateWhenCurrentLocation(this, gameTime) ----
      * Every machine is a plain Object, so this is where they all pass. */
     void HookObjectUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(objectupdate);
         if (AutomateOn() && s_collecting && self != nullptr) {
             RegHarvest(self);
         }
@@ -16300,7 +19389,6 @@ namespace {
     constexpr bool kTractorDiagSpawn = false;
     constexpr uintptr_t kHorseCtorOff    = SDV_OFF(kHorseCtorOff, 0x12317F0u);
     constexpr uintptr_t kGetFarmOff      = SDV_OFF(kGetFarmOff, 0x1464FF0u);
-    constexpr uintptr_t kGetLocNowOff    = SDV_OFF(kGetLocNowOff, 0x14407B0u);
     constexpr uintptr_t kNetRefSetOff    = SDV_OFF(kNetRefSetOff, 0x198A050u);
     constexpr uintptr_t kPressUseToolOff = SDV_OFF(kPressUseToolOff, 0x147BDE0u);
     constexpr uintptr_t kCurrentToolOff  = SDV_OFF(kCurrentToolOff, 0x13B8E20u);
@@ -16617,7 +19705,7 @@ namespace {
         }
         s_machTx = tx;
         s_machTy = ty;
-        void* loc = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        void* loc = SafeCurrentLocation();
         if (loc == nullptr || !Plausible(loc) ||
             !RangeReadable(reinterpret_cast<unsigned char*>(loc) + kObjectsOff, 8u)) {
             return;
@@ -16940,7 +20028,11 @@ namespace {
         }
         const int cap = *reinterpret_cast<int*>(capCell);
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
-        if (buf == nullptr || n < 0) {
+        /* v557: a sanity band on the size, an inconsistent capacity, and the
+         * real requirement -- n+1 pointers have to fit inside the buffer.
+         * Plausible(buf) alone only proved the page was mapped. */
+        if (buf == nullptr || n < 0 || n > 4096 || cap < n || cap > 65536 ||
+            !ListRangeOk(buf, n + 1)) {
             return false;
         }
         if (n < cap) {
@@ -17030,7 +20122,8 @@ namespace {
             return false;
         }
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
-        if (buf == nullptr || !Plausible(buf)) {
+        /* v557: n entries have to fit, not just the first byte. */
+        if (!ListRangeOk(buf, n)) {
             return false;
         }
         void** elems = reinterpret_cast<void**>(buf);
@@ -17102,7 +20195,7 @@ namespace {
             return 0;
         }
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
-        if (buf == nullptr || !Plausible(buf)) {
+        if (!ListRangeOk(buf, n)) {      /* v557: the whole run must fit */
             return 0;
         }
         void** elems = reinterpret_cast<void**>(buf);
@@ -17141,7 +20234,7 @@ namespace {
         }
         const int n = *reinterpret_cast<int*>(static_cast<char*>(locs) + kTrkListSizeOff);
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
-        if (buf == nullptr || !Plausible(buf) || n <= 0 || n > 512) {
+        if (n <= 0 || n > 512 || !ListRangeOk(buf, n)) {   /* v557 */
             return;
         }
         void** elems = reinterpret_cast<void**>(buf);
@@ -17222,7 +20315,7 @@ namespace {
              * not need a list entry, and AnimalPage.FindAnimals already counts
              * it once through Farmer.mount.  Leaving it in the list as well is
              * what made the animal page show it twice. */
-            void* now = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+            void* now = SafeCurrentLocation();
             if (now != nullptr && Plausible(now)) {
                 if (RemoveFromCharacters(now, horse)) {
                     LOGF("tractor: hidden after mount");
@@ -17230,7 +20323,7 @@ namespace {
             }
             return;
         }
-        void* here = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+        void* here = SafeCurrentLocation();
         if (here == nullptr || !Plausible(here) || !LocationAllowsTractor(here)) {
             return;
         }
@@ -17358,7 +20451,9 @@ namespace {
         }
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
         const int n = *reinterpret_cast<int*>(static_cast<char*>(list) + kTrkListSizeOff);
-        if (buf == nullptr || n <= 0 || n > 512) {
+        /* v557: this used to check n but not the buffer at all -- the only
+         * walk in the file that could follow a garbage element pointer. */
+        if (n <= 0 || n > 512 || !ListRangeOk(buf, n)) {
             return nullptr;
         }
         void** elems = reinterpret_cast<void**>(buf);
@@ -17392,7 +20487,7 @@ namespace {
         }
         const int n = *reinterpret_cast<int*>(static_cast<char*>(locs) + kTrkListSizeOff);
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
-        if (buf == nullptr || !Plausible(buf) || n <= 0 || n > 512) {
+        if (n <= 0 || n > 512 || !ListRangeOk(buf, n)) {   /* v557 */
             return nullptr;
         }
         void** elems = reinterpret_cast<void**>(buf);
@@ -17428,12 +20523,27 @@ namespace {
         return true;
     }
 
+    /* v545: pressing the key used to leave no trace at all when one of the
+     * gates below said no, which is exactly the "nothing happens" report.
+     * Every exit now writes one line, capped so a stuck user cannot flood the
+     * card.  Remove once the cause is known. */
+    static unsigned s_tractorDbg = 0;
+    void TractorDbg(const char* why, void* a, void* b) {
+        if (s_tractorDbg >= 24u) {
+            return;
+        }
+        ++s_tractorDbg;
+        LOGF("tractor: %s (%p/%p) on=%u", why, a, b, g_tractorOn);
+    }
+
     void TrySpawnTractor() {
         if (!kTractor) {
+            TractorDbg("feature off", nullptr, nullptr);
             return;
         }
         void* pl = reinterpret_cast<void* (*)(void*)>(g_base + kGetPlayerOff)(nullptr);
         if (pl == nullptr || !Plausible(pl)) {
+            TractorDbg("no player", nullptr, nullptr);
             return;
         }
         /* Already riding something: leave the one shot unused rather than burn
@@ -17442,6 +20552,7 @@ namespace {
         void* mountRef = *reinterpret_cast<void**>(static_cast<char*>(pl) + kFarmerNetMountOff);
         if (mountRef == nullptr || !Plausible(mountRef)) {
             if (!kTractorDiagSpawn) {
+                TractorDbg("no netMount wrapper", mountRef, nullptr);
                 return;
             }
         }
@@ -17457,18 +20568,24 @@ namespace {
                     s_tractorTried = true;
                     LOGF("tractor: already riding it");
                 }
+                else {
+                    TractorDbg("riding something else", riding, nullptr);
+                }
                 return;
             }
         }
-        void* here = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+        void* here = SafeCurrentLocation();
         if (here == nullptr) {
+            TractorDbg("no current location", nullptr, nullptr);
             return;
         }
         if (!kTractorDiagSpawn) {
             /* Empty hand only.  This one applies EVERYWHERE: pressing the
              * use-tool key while holding a tool must never teleport a horse. */
-            if (reinterpret_cast<void* (*)(void*)>(g_base + kCurrentToolOff)(pl) !=
-                nullptr) {
+            void* heldTool = reinterpret_cast<void* (*)(void*)>(
+                g_base + kCurrentToolOff)(pl);
+            if (heldTool != nullptr) {
+                TractorDbg("holding a tool", heldTool, nullptr);
                 return;
             }
         }
@@ -17520,9 +20637,11 @@ namespace {
              * both the "vanished" case and the "left it on the farm and walked
              * to town" case. */
             if (!LocationAllowsTractor(here)) {
+                TractorDbg("location refuses the tractor", here, existing);
                 return;                  /* never park it indoors */
             }
             if (!AdoptTractor(here, existing)) {
+                TractorDbg("adopt failed", here, existing);
                 return;
             }
             const Vec2 p =
@@ -17547,6 +20666,7 @@ namespace {
             void* farm =
                 reinterpret_cast<void* (*)(void*)>(g_base + kGetFarmOff)(nullptr);
             if (farm == nullptr || here != farm) {
+                TractorDbg("not on the farm (create is farm-only)", here, farm);
                 return;
             }
         }
@@ -17587,10 +20707,15 @@ namespace {
     static bool (*s_origPressUseTool)() = nullptr;
 
     bool HookPressUseTool() {
+
+        HIT_NO_WORLD(pressusetool);
         /* v304: master switch off -- behave exactly like vanilla. */
         if (g_tractorOn == 0) {
+            TractorDbg("master switch is off", nullptr, nullptr);
             return s_origPressUseTool != nullptr ? s_origPressUseTool() : false;
         }
+        TractorDbg("press", nullptr,
+                   reinterpret_cast<void*>(s_origPressUseTool));
         TrySpawnTractor();
         /* The game refuses to use a tool while mounted.  pressUseToolButton
          * 0x147BDE0 branches on `player.isRidingHorse()` and takes the
@@ -17617,12 +20742,75 @@ namespace {
                                           ? s_origPressUseTool()
                                           : false;
                     s_forceTractorPower = false;
-                    *slot = horse;
+                    /* v552: only put the mount back if nobody claimed the slot
+                     * while the original ran.  Being knocked off the tractor
+                     * by a monster does exactly that: the game dismounts and
+                     * writes its own value, and restoring the old horse over it
+                     * left the farmer pointing at a horse that is no longer
+                     * mounted -- the console froze with the tractor on screen.
+                     * If the pointer changed, leave whatever the game put
+                     * there and let its own dismount stand. */
+                    void* now = *slot;
+                    if (now == nullptr) {
+                        *slot = horse;
+                    }
+                    else if (now != horse) {
+                        TractorDbg("mount changed during the use, not restoring",
+                                   now, horse);
+                    }
                     return used;
                 }
             }
         }
         return s_origPressUseTool != nullptr ? s_origPressUseTool() : false;
+    }
+
+    /* ---- v553: mounting the tractor on Ginger Island -------------------
+     *
+     * Vanilla mounts a horse inside GameLocation.checkAction ("the tile in
+     * front is a horse -> ride it").  Every island map overrides that method
+     * (IslandLocation 0x1650400, IslandNorth 0x1654C10, IslandSouth 0x165DCC0,
+     * IslandWest 0x1668B60) and none of those overrides looks at characters at
+     * all -- the island never had a horse, so nobody wrote that branch.  That
+     * is why A does nothing there while Y (our own summon) works.
+     *
+     * The hooks below only mount when the faced tile is OUR tractor, judged by
+     * HorseId, and forward everything else untouched.
+     */
+    using IslandCheckActionFn = bool (*)(void*, long, long, long, void*);
+    static IslandCheckActionFn s_origIslandCheck[4] = {nullptr, nullptr,
+                                                       nullptr, nullptr};
+
+    bool HookIslandCheckAction(void* self, long tileLoc, long r0, long r1,
+                               void* who) {
+
+        HIT_NO_WORLD(islandcheckaction);
+        if (kTractor && g_tractorOn != 0 && self != nullptr &&
+            Plausible(self)) {
+            const int tx = static_cast<int>(tileLoc & 0xFFFFFFFFLL);
+            const int ty = static_cast<int>(
+                static_cast<unsigned long long>(tileLoc) >> 32);
+            void* horse = FindTractorIn(self);
+            void* pl = reinterpret_cast<void* (*)(void*)>(
+                g_base + kGetPlayerOff)(nullptr);
+            if (horse != nullptr && IsOurTractor(horse) && pl != nullptr &&
+                Plausible(pl)) {
+                const Vec2 pos = reinterpret_cast<Vec2 (*)(void*)>(
+                    g_base + kGetPositionOff)(horse);
+                const int hx = static_cast<int>(pos.x) / 64;
+                const int hy = static_cast<int>(pos.y) / 64;
+                if (hx == tx && hy == ty) {
+                    if (MountTractor(pl, horse)) {
+                        LOGF("tractor: mounted by A at %d,%d", tx, ty);
+                        return true;
+                    }
+                }
+            }
+        }
+        if (s_origIslandCheck[0] != nullptr) {
+            return s_origIslandCheck[0](self, tileLoc, r0, r1, who);
+        }
+        return false;
     }
 
     /* ---- stage 2: area of effect while on the tractor ------------------
@@ -17658,6 +20846,8 @@ namespace {
     static void* (*s_origTilesAffected)(void*, Vec2, int, void*) = nullptr;
 
     void* HookTilesAffected(void* self, Vec2 tile, int power, void* who) {
+
+        HIT_NO_WORLD(tilesaffected);
         if (kTractor && power < kTractorPower) {
             /* Two ways to be "on the tractor", because the tool does not fire
              * inside pressUseToolButton at all:
@@ -17806,7 +20996,7 @@ namespace {
      * inventory, so `item` becomes garbage: the loop re-reads ActiveObject
      * before every tile and stops as soon as it is no longer the same object. */
     void PlaceHeldItemPerTile(void* pl, void* item, int tx, int ty) {
-        void* here = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+        void* here = SafeCurrentLocation();
         if (here == nullptr || !Plausible(here)) {
             return;
         }
@@ -18505,16 +21695,24 @@ namespace {
             static_cast<char*>(pl) + kFarmerNetMountOff);
         void** mountSlot = nullptr;
         void* horse = nullptr;
-        if (mountRef != nullptr && Plausible(mountRef)) {
+        if (mountRef != nullptr && Plausible(mountRef) &&
+            RangeReadable(static_cast<char*>(mountRef) + kNetValueOff2, 8u)) {
             mountSlot = reinterpret_cast<void**>(
                 static_cast<char*>(mountRef) + kNetValueOff2);
             horse = *mountSlot;
         }
-        if (mountSlot != nullptr && horse != nullptr) {
+        const bool cleared = (mountSlot != nullptr && horse != nullptr);
+        if (cleared) {
             *mountSlot = nullptr;
         }
         const int got = checkAction(here, loc, xy, wh, pl);
-        if (mountSlot != nullptr) {
+        /* v558: v552's rule, applied to this second mount-hiding site.  Put the
+         * horse back only while the slot still holds the nullptr written above.
+         * If the game changed netMount during the call (knocked off, warped,
+         * scripted dismount), restoring the old pointer leaves the farmer
+         * pointing at a horse that is no longer his mount -- the state that
+         * froze the console after v551. */
+        if (cleared && *mountSlot == nullptr) {
             *mountSlot = horse;
         }
         if (got != 0) {
@@ -18696,7 +21894,7 @@ namespace {
      * a `mov w0,#1; ret` stub in this build -- see the v497 note). */
     bool ProbeOtherFacing(int tx, int ty, void* here, void* dict) {
         if (here == nullptr || !Plausible(here)) {
-            here = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+            here = SafeCurrentLocation();
         }
         if (here == nullptr || !Plausible(here)) {
             return false;
@@ -19176,7 +22374,7 @@ namespace {
         if (pl == nullptr) {
             return;
         }
-        void* here = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        void* here = SafeCurrentLocation();
         if (here == nullptr || !Plausible(here)) {
             return;
         }
@@ -19242,7 +22440,7 @@ namespace {
         if (pl == nullptr) {
             return;
         }
-        void* here = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        void* here = SafeCurrentLocation();
         if (here == nullptr || !Plausible(here)) {
             return;
         }
@@ -19380,7 +22578,7 @@ namespace {
             return;                       /* unknown tool class: do nothing */
         }
         mark(8);
-        void* here = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+        void* here = SafeCurrentLocation();
         if (here == nullptr) {
             return;
         }
@@ -20299,7 +23497,7 @@ namespace {
         /* Not riding and nothing cached (e.g. right after loading a save).
          * Walking the character list is expensive, so do it only when the
          * location actually changed. */
-        void* loc = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+        void* loc = SafeCurrentLocation();
         if (loc == nullptr || !Plausible(loc)) {
             return nullptr;
         }
@@ -20387,6 +23585,8 @@ namespace {
     static void* (*s_origFindAnimals)(void*) = nullptr;
 
     void* HookFindAnimals(void* self) {
+
+        HIT_NO_WORLD(findanimals);
         void* list = s_origFindAnimals != nullptr ? s_origFindAnimals(self) : nullptr;
         const bool first = (s_iconCalls++ == 0);
         if (!kTractor || g_tractorOn == 0 || list == nullptr || !Plausible(list)) {
@@ -20410,7 +23610,7 @@ namespace {
             /* CurrentTractorHorse throttles its list walk, so one call is not a
              * guarantee.  Walk the current location directly -- this hook runs
              * once per page build, not per frame, so the cost is irrelevant. */
-            void* loc = reinterpret_cast<void* (*)(void*)>(g_base + kGetLocNowOff)(nullptr);
+            void* loc = SafeCurrentLocation();
             if (loc != nullptr && Plausible(loc)) {
                 horse = FindTractorIn(loc);
             }
@@ -20443,7 +23643,7 @@ namespace {
         }
         const int n = *reinterpret_cast<int*>(static_cast<char*>(list) + kTrkListSizeOff);
         void* buf = *reinterpret_cast<void**>(static_cast<char*>(store) + kTrkStoreBufOff);
-        if (buf == nullptr || !Plausible(buf) || n <= 0 || n > 64) {
+        if (n <= 0 || n > 64 || !ListRangeOk(buf, n)) {    /* v557 */
             return list;
         }
         void** elems = reinterpret_cast<void**>(buf);
@@ -20482,6 +23682,12 @@ namespace {
             }
             int* rect = reinterpret_cast<int*>(
                 static_cast<char*>(entry) + kAnimalEntryRectOff);
+            /* v557: the rect is the only field this hook WRITES, and it used to
+             * be reached from a Plausible(entry) alone -- a wrong AnimalEntry
+             * layout would have stored two ints into whatever follows it. */
+            if (!RangeReadable(rect, 8u)) {
+                continue;
+            }
             if (y0 < 0) {
                 y0 = rect[1];
             }
@@ -20528,24 +23734,63 @@ namespace {
      * holds every session slot, and each attempt repeats only the step that
      * failed (sdlog keeps g_fs_ready). */
     void EnsureSettings() {
+        /* v648: NEVER touch fs.  Step() is what calls smInitialize /
+         * fsInitialize / fsOpenSdCardFileSystem, and holding (or cycling)
+         * those sessions is the root of both the applet-switch hang and the
+         * flash-exit.  The RAM ring needs no setup beyond exl_main's Init(). */
+        return;
+        if (kNoLog) {
+            return;
+        }
+        /* v647: the channel is a one-way door.  Without this check Step()
+         * would run again after Shutdown() and cycle sm:/fsp-srv sessions --
+         * the behaviour that preceded the flash-exit. */
+        if (sdlog::ShutdownDone()) {
+            return;
+        }
         if (sdlog::IsOpen()) {
             return;
         }
-        /* Retried forever, slowly.  The failure is a service-session problem in
-         * this process, so the only way in is to catch a moment when a slot is
-         * free (e.g. while the game has just torn something down).  Each retry
-         * repeats only the step that failed -- sdlog keeps g_fs_ready. */
-        if (s_logTry >= 20u) {
-            return;                 /* given up: fs is not reachable here */
-        }
-        if ((s_logFrame++ % 600u) != 0u && s_logTry != 0u) {
+        /* SDLOG-2/3: do not touch fs at all during the first ten seconds.
+         * SDLOG-1 opened the store on the very first Update tick, which on the
+         * loading screen means "while the game is itself mounting the save" --
+         * the worst possible moment, and the reason a console froze there. */
+        /* v646: repeat the warm-up for every world.  s_logFrame only ever
+         * counted the first 600 frames of the process; after Shutdown() a new
+         * world would otherwise open fs immediately, while the game is still
+         * mounting that save -- SDLOG-1's exact hang. */
+        if (s_stFrame < g_logWarmup + 600u) {
             return;
         }
-        if (s_logTry < 0xFFFFu) {
-            ++s_logTry;
-        }
-        if (sdlog::Open()) {
-            LOGF("log: open ok channel=%d", sdlog::Channel());
+        /* SDLOG-3/4: one blocking fs call per frame, on this thread.
+         *
+         * SDLOG-2 moved the same calls to a worker thread so the picture could
+         * not freeze; the worker had no IPC buffer of its own (armGetTls() is
+         * TPIDRRO_EL0, per-thread and kernel-owned), so it wrote into the
+         * game's cmif buffer and the title crashed a few seconds in.  Steps
+         * instead, and every step leaves a marker file on the SD card whose
+         * name carries its result code -- the on-screen readout turned out to
+         * be dead code, so the card is the only honest channel. */
+        sdlog::Step();
+        /* v569: a log has to name the build that wrote it.  Until now the number
+         * lived only on the diagnostic panel, so answering "which build is this
+         * log from" required a photograph of the screen -- and v567 hid that
+         * panel inside the mines, which made it worse.  One line per session,
+         * written the first time the channel opens. */
+        /* v646: one banner per world section, so a log that spans several
+         * saves still says which build wrote each part. */
+        static unsigned s_bannerEpoch = ~0u;
+        if (s_bannerEpoch != g_logEpoch && sdlog::IsOpen()) {
+            s_bannerEpoch = g_logEpoch;
+            /* v638: the startup patches are the only thing of ours that runs
+             * before this line can be written, so their result is reported
+             * here instead of where they run. */
+            LOGF("sdv_native build %d patch: naming=%s ok=%d fail=%d",
+                 kBuildNo,
+                 (s_patchNaming == 1)
+                     ? "applied"
+                     : ((s_patchNaming == 0) ? "REFUSED" : "notrun"),
+                 s_patchOk, s_patchFail);
         }
     }
 
@@ -20562,8 +23807,450 @@ namespace {
     void ServiceTimeRequest();
     void UpdateWeatherCache();
 
+    /* v559 DIAG (temporary): the "right stick freezes the game" report.
+     *
+     * Holding the right stick is what opens vanilla's EmoteMenu --
+     * Game1.update does `if (options.gamepadControls && rightStickHoldTime >=
+     * emoteMenuShowTime && activeClickableMenu == null) emoteMenu = new
+     * EmoteMenu();` -- so a freeze that starts exactly there is either that
+     * menu, the asset it loads on the spot, or something wrapped around it.
+     * The mod binds nothing to R3 (no hid service, no input hook), so these
+     * three lines are what tells the report apart:
+     *
+     *   dbg: R3 hold ...      the game sees the press at all
+     *   dbg: emoteMenu ...    the menu object appeared
+     *   dbg: emote tick N     how many more Game1.Update frames ran
+     *
+     * If the log ends on "hold" with no emoteMenu line, the freeze is before
+     * the menu exists (input / asset layer).  If it ends on a tick, the update
+     * loop was alive with the emote menu up, so the freeze is inside it.
+     * Remove this block once the report is closed. */
+    static int  s_dbgHold = 0;
+    static int  s_dbgMenu = 0;
+    static void* s_dbgMenuPtr = nullptr;
+    static void* s_dbgEmote = nullptr;
+    static unsigned s_dbgEmoteFrames = 0;
+    void DiagRightStick() {
+        const auto* holdCell = reinterpret_cast<const int*>(g_base + 0xC95BAECu);
+        const auto* showCell = reinterpret_cast<const int*>(g_base + 0xC95BAF0u);
+        const int hold = *holdCell;
+        if (hold != s_dbgHold) {
+            const int show = *showCell;
+            if (hold == 0) {
+                LOGF("dbg: R3 released (show=%d)", show);
+            }
+            else if (s_dbgHold == 0) {
+                LOGF("dbg: R3 held (show=%d)", show);
+            }
+            else if ((hold / 100) != (s_dbgHold / 100)) {
+                LOGF("dbg: R3 hold %d ms", hold);
+            }
+            s_dbgHold = hold;
+        }
+        void* menu = *reinterpret_cast<void**>(g_base + kGame1MenuOff);
+        if (menu != s_dbgMenuPtr) {
+            s_dbgMenuPtr = menu;
+            s_dbgMenu = 1;
+            LOGF("dbg: menu %p (hold=%d)", menu, hold);
+        }
+        void* emote = *reinterpret_cast<void**>(g_base + 0xC95C240u);
+        if (emote != s_dbgEmote) {
+            s_dbgEmote = emote;
+            s_dbgEmoteFrames = 0;
+            LOGF("dbg: emoteMenu %p (hold=%d)", emote, hold);
+        }
+        else if (emote != nullptr && s_dbgEmoteFrames < 40u) {
+            ++s_dbgEmoteFrames;
+            LOGF("dbg: emote tick %u (menu=%p)", s_dbgEmoteFrames,
+                 s_dbgMenuPtr);
+        }
+    }
+
+    /* v561: make the right stick do nothing at all.
+     *
+     * Two vanilla features hang off the same timer, and they are told apart by
+     * how long the button is held:
+     *
+     *   hold >= emoteMenuShowTime (250 ms)  -> EmoteMenu
+     *   release with 0 < hold < 250 ms      -> ChatBox.activate()
+     *
+     * (Game1.update, around `rightStickHoldTime >= emoteMenuShowTime` and the
+     * `!IsButtonDown(RightStick) && rightStickHoldTime < emoteMenuShowTime`
+     * chat arm.)  The freeze reproduces with EVERY hook disabled (v560) and
+     * the v559 log shows the emote menu being built, so the timer is the thing
+     * to clamp: zeroing rightStickHoldTime (0xC95BAEC) every frame keeps both
+     * arms unreachable -- R3 simply does nothing.
+     *
+     * Setting emoteMenuShowTime huge would only kill the emote arm; the chat
+     * arm compares the same value the other way round, so every release would
+     * open the chat box instead.  Clamping the timer has no such side effect.
+     * One compare per frame, a 4-byte store only while the stick is held. */
+    /* v615: the clamp is now an A/B switch, and the build ships with it OFF.
+     *
+     * v561 added it because holding R3 opened EmoteMenu and that froze the
+     * console; zeroing rightStickHoldTime keeps both arms of Game1.update
+     * unreachable (hold >= emoteMenuShowTime -> emotes, release under it ->
+     * ChatBox.activate).  The user's read is that this global suppression is
+     * what breaks the text box, and the address checks out -- meta_game1.json
+     * has 0xC95BAEC = rightStickHoldTime (the same table confirms 0xC95C140 =
+     * _activeClickableMenu and 0xC95C260 = netWorldState, so the table is
+     * trustworthy for this one).  A per-frame store into a field the input
+     * state machine owns is a real suspect, and the only way to settle it is to
+     * stop doing it.
+     *
+     * OFF means R3 behaves like vanilla again: hold -> emote menu, click ->
+     * chat box, both of which are known to be able to freeze this console.
+     * Do not press R3 while testing this build. */
+    /* v620: back ON.  v615 turned it off to A/B the character-creation freeze
+     * (verdict: innocent there -- the freeze survived without it), but it was
+     * never restored, and the v619 session proved why it exists: with the ban
+     * lifted, pressing R in-game ran the vanilla R3 path (single click -> chat
+     * box) and froze the console exactly like the pre-v561 reports.  The
+     * every-frame write is safe -- it ran from v561 to v614 across days of
+     * normal play. */
+    constexpr bool kStickSuppress = true;
+
+    void SuppressStickMenus() {
+        if (!kStickSuppress) {
+            return;
+        }
+        int* hold = reinterpret_cast<int*>(g_base + 0xC95BAECu);
+        if (!RangeReadable(hold, sizeof(int))) {
+            return;
+        }
+        if (*hold != 0) {
+            *hold = 0;
+        }
+    }
+
+    /* ---- v614: stage marks for the character-creation freeze ----
+     *
+     * The console dies on the very click that opens a text box: music playing,
+     * picture stopped, system keyboard never appears.  v613 removed every fs
+     * write in that window and it still froze, so the log is not the cause --
+     * and because that build's write gate also closed before the world
+     * existed, it produced no evidence at all.
+     *
+     * These marks are the evidence.  One short line per stage, EVERY frame:
+     * a freeze is one frame that never ends, so sampling every fourth frame
+     * would miss it three times out of four.  ~11 lines a frame is affordable
+     * with the held-handle writer (2 IPCs a line) and the log caps are raised
+     * to match.  Turn kStageTrace off once the answer is in. */
+    /* v621: OFF.  The per-frame marks did their job -- they are what proved the
+     * freeze happened after Game1.Update returned and before DrawHUD -- and
+     * they now cost more than they are worth: thirteen lines a frame, each one
+     * two fs IPCs on the main thread, is a visible stutter (walking arrives in
+     * jumps).  v620 made it worse by routing them through LineForce, which
+     * bypasses the token bucket, so every single line landed on the card. */
+    constexpr bool kStageTrace = false;
+    /* v646: s_stFrame moved up beside s_worldAlive.  EnsureSettings() is
+     * defined above this point but needs the frame number for the per-world
+     * fs warm-up. */
+    /* v616: what the update phase decided, for the draw hook to read.  Draw
+     * cannot call WorldIsRunning() itself -- that calls a managed getter -- so
+     * the answer is cached here every frame.
+     * v636: defined early (see s_mapPage) because the one-shot hook hit log
+     * tests it from hooks defined far above this point. */
+
+    void StMark(const char* tag) {
+        if (kStageTrace && !kNoLog) {
+            /* v620: LineForce -- the bucket's silent drops once made the last
+             * mark point at the wrong function.  Marks must never drop. */
+            sdlog::LineForce("st %s f=%u", tag, s_stFrame);
+        }
+    }
+
+    /* v614: is the world actually running?
+     *
+     * False while a menu is up or before any location exists.  Both are states
+     * in which this hook must not allocate managed memory: the animal-naming
+     * freeze (v492) and the character-creation freeze have the same shape --
+     * a text box opens, the world pauses, and an allocation here with no GC
+     * root turns into a collection the game cannot finish.  v492 only guarded
+     * BuildTileLabels(); everything the HUD builds needs the same rule.
+     *
+     * The menu pointer is a plain static read.  get_CurrentLocation is a
+     * managed static getter, which is fine in the update phase (the HUD has
+     * called it for many versions). */
+    /* v643: the single world predicate used by BOTH the update hook and the
+     * draw hook.  They must agree, or the draw path runs the HUD against a
+     * dead save while the update path has stood down (that mismatch is what
+     * v635 tried to patch hook by hook).
+     *
+     * While g_titleMode is set, this returns false WITHOUT calling a single
+     * game getter: a stale Game1.currentLocation is not a world.  That is the
+     * cold-boot behaviour, which is the one path hardware has proven safe. */
+    bool GameWorldRunning(void* menuNow) {
+        if (menuNow != nullptr || g_base == 0) {
+            return false;
+        }
+        if (g_titleMode != 0) {
+            return false;
+        }
+        if (SafeCurrentLocation() == nullptr) {
+            return false;
+        }
+        /* A location with no player is a leftover, not a running farm.
+         * get_player is a single static load (0x1440570), safe to ask. */
+        return CarryPlayer() != nullptr;
+    }
+
+    bool WorldIsRunning() {
+        if (!RangeReadable(reinterpret_cast<void*>(g_base + kGame1MenuOff), 8u)) {
+            return false;
+        }
+        void* menuNow = *reinterpret_cast<void**>(g_base + kGame1MenuOff);
+        return GameWorldRunning(menuNow);
+    }
+
     void HookGameUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(gameupdate);
+        ++s_stFrame;
+        /* v618: while a menu is open, this hook does nothing at all.
+         *
+         * The v492 note left this rule behind, word for word: "A naming menu
+         * pauses the world, so checkForSingleAnimation and the draw hooks are
+         * not even reached -- but Game1.Update still runs every frame, which
+         * makes HookGameUpdate the only code of ours that executes while the
+         * menu is up.  If the menu is still on screen when the game freezes,
+         * this is where to look."
+         *
+         * The v616 log is exactly that shape: after the freeze there is not one
+         * `d0` line (the draw hook never ran), while `u0..u_end` kept printing
+         * every frame.  So on the character-creation screen THIS FUNCTION is
+         * the only thing of ours that touches the game, and the freeze happens
+         * in the frame built by it.
+         *
+         * Standing down here makes the console behave, with a menu open, exactly
+         * like a build with no mod at all -- and costs nothing: a paused world
+         * cannot use automation, the tractor, the mine hooks or the HUD, and the
+         * mod's own page is driven by HookGameMenuUpdate, not from here.  The
+         * two marks make the log distinguish "we stood down" from "we never
+         * got this far".
+         *
+         * If this build still freezes, then this function is innocent and the
+         * next step is the no-hook build (v617, kDiagNoHooks). */
+        /* v634: the gate asks one question now -- "is there a world?" -- instead
+         * of "is a menu open?".
+         *
+         * The character-creation screen does not always keep a clickable menu
+         * in the slot this hook checks, so a menu-only gate let the whole body
+         * below run on the exact frames the game was handing the display over
+         * to the system keyboard.  Nothing below can do anything useful without
+         * a location anyway: automation, the tractor, the mine hooks, the HUD
+         * sampling and the save plumbing all need one.  Standing down until a
+         * location exists makes this hook behave exactly like the no-hook build
+         * (v617, which was the one build that never froze on that screen) while
+         * costing nothing in play.
+         *
+         * One line every 300 frames (~5 s) records menu/world so a freeze can
+         * still say which branch was being taken and how far the main thread
+         * got. */
+        void* menuNow = nullptr;
+        if (RangeReadable(reinterpret_cast<void*>(g_base + kGame1MenuOff), 8u)) {
+            menuNow = *reinterpret_cast<void**>(g_base + kGame1MenuOff);
+        }
+        /* v643: unlock only on a GENUINELY NEW world.  Checked every 30 frames
+         * so the title screen stays as quiet as a cold boot.  Either a new
+         * GameLocation or a new Farmer (a different pointer from the last
+         * save) means the player actually loaded/created another farm; a
+         * recycled pointer from the save we just left does not. */
+        if (g_titleMode != 0 && (s_stFrame % 30u) == 0u) {
+            void* locNow = SafeCurrentLocation();
+            /* Only ask the game for the player when the location pointer has
+             * actually CHANGED.  A stale pointer from the save we just left
+             * must not make us call a managed getter on the title screen --
+             * the cold-boot path (known safe) calls none at all. */
+            if (locNow != nullptr && locNow != g_lastWorldLoc) {
+                void* plNow = CarryPlayer();
+                if (plNow != nullptr) {
+                    g_titleMode = 0;
+                    g_lastWorldLoc = locNow;
+                    g_lastWorldPl = plNow;
+                }
+            }
+            /* Rare fallback for a recycled location address: a new Farmer is
+             * still proof of a new farm.  Checked once every 300 frames. */
+            else if (locNow != nullptr && (s_stFrame % 300u) == 0u) {
+                void* plNow = CarryPlayer();
+                if (plNow != nullptr && plNow != g_lastWorldPl) {
+                    g_titleMode = 0;
+                    g_lastWorldLoc = locNow;
+                    g_lastWorldPl = plNow;
+                }
+            }
+        }
+        const bool hasWorld = GameWorldRunning(menuNow);
+        if (hasWorld) {
+            /* Remember the identity of the running save so the latch can tell
+             * a real new farm from the stale pointer after "return to title". */
+            void* locNow = SafeCurrentLocation();
+            if (locNow != nullptr) {
+                g_lastWorldLoc = locNow;
+                void* plNow = CarryPlayer();
+                if (plNow != nullptr) {
+                    g_lastWorldPl = plNow;
+                }
+            }
+        }
+        /* v641: the v613 design finally has a caller.
+         *
+         * sdlog::SetGate() has existed since v613 and its own comment says
+         * "the update hook closes the gate until a location exists" -- but it
+         * never had a single call site.  Every build from v613 to v640 kept an
+         * open FsFile and kept appending gate:/hit: lines on the
+         * character-creation screen, i.e. during the applet switch that brings
+         * up the system software keyboard.  v617 installed no hooks at all,
+         * so sdlog::Step() never ran and the module never touched fs -- and
+         * that is the ONE build that never froze on this screen.
+         *
+         * v644/v645: the quiet experiment was disproven (v641 still hung), and
+         * it hid the tail of the log exactly where the console dies.  The gate
+         * stays open; kNoLog decides whether the fs channel exists at all. */
+        static bool s_gateInit = false;
+        static bool s_wasWorld = false;
+        /* v644: v641 silenced every log line and closed the fs handle during
+         * the no-world window.  v641 still produced the same 2162-0004, so
+         * that theory is dead -- and it blinded us exactly where the console
+         * dies (the log stops at "gate: leave world" by construction).
+         * Restore v639-level logging (gate: every 300 frames, hit: once):
+         * normal volume, and the tail is readable again. */
+        if (!s_gateInit) {
+            s_gateInit = true;
+            s_wasWorld = hasWorld;
+            g_logQuiet = 0;
+            sdlog::SetGate(true);
+            if (hasWorld) {
+                g_logWarmup = s_stFrame;   /* v646: cold boot into a save */
+            }
+        }
+        else if (hasWorld != s_wasWorld) {
+            if (!hasWorld) {
+                LOGF("gate: leave world f=%u", s_stFrame);
+                /* v643: latch the title mode.  From here until a genuinely new
+                 * farm appears, GameWorldRunning() answers false without
+                 * touching a game getter, so a stale location pointer can no
+                 * longer flip us back into "world is running" on the
+                 * character-creation screen. */
+                /* v644: only latch when NO menu is up.  Opening the TV,
+                 * inventory or a dialogue also flips hasWorld to false, and
+                 * v643 treated that as "returned to title": the HUD then
+                 * stayed dark until the location pointer changed (the user's
+                 * "watch TV -> HUD gone, change scene -> HUD back").  With a
+                 * menu up GameWorldRunning() is already false, so those frames
+                 * need no latch. */
+                if (menuNow == nullptr) {
+                    g_titleMode = 1;
+                }
+            }
+            sdlog::SetGate(true);
+            g_logQuiet = 0;
+            if (hasWorld) {
+                /* v646: reopen for this world, after the fresh 600-frame
+                 * warm-up in EnsureSettings().  The channel is still down
+                 * here, so this line itself is a no-op; the banner marks the
+                 * point where it comes back. */
+                g_logWarmup = s_stFrame;
+                ++g_logEpoch;
+                LOGF("gate: enter world f=%u", s_stFrame);
+            }
+            s_wasWorld = hasWorld;
+        }
+        {
+            static unsigned s_gateTick = 0;
+            if ((++s_gateTick % 300u) == 0u) {
+                LOGF("gate: f=%u menu=%d world=%d", s_stFrame,
+                     menuNow != nullptr ? 1 : 0, hasWorld ? 1 : 0);
+            }
+        }
+        /* v646: release the WHOLE fs channel before the system-keyboard
+         * applet switch.  Do NOT gate this on menuNow or on a hasWorld edge:
+         * the character-creation screen IS a menu, the save-exit confirmation
+         * is a menu, and hasWorld can already be false when either appears,
+         * so an edge-triggered test can miss the teardown completely.
+         *
+         * Instead: once the world has been away for 60 frames (~1 s), shut
+         * down sm:/fsp-srv/the SD filesystem and leave them down.  That is
+         * well before anyone can reach a text box, and it puts the process in
+         * exactly the zero-fs-session state that v645 proved safe on hardware.
+         * A short TV/inventory pause that comes back inside the grace period
+         * keeps the channel; a longer one reopens after a fresh 600-frame
+         * warm-up, appending to the same log. */
+        static unsigned s_noWorldFrames = 0;
+        if (!hasWorld) {
+            if (s_noWorldFrames < 60u) {
+                ++s_noWorldFrames;
+            }
+        } else {
+            s_noWorldFrames = 0;
+        }
+        if (!hasWorld && s_noWorldFrames >= 60u && sdlog::IsOpen()) {
+            /* Written while the channel is still up, so a reader of the log
+             * knows why the tail stops instead of assuming a crash. */
+            LOGM("log: channel closed for this process; restart game to log again");
+            sdlog::Shutdown();
+        }
+
+        /* v656: FitGridToMenu runs HERE, before the stand-down gate below.
+         *
+         * This is why the v539 fix "never worked" and then came back to life
+         * twice.  v618 stood this hook down whenever a menu is open (v634
+         * renamed the question to "is there a world", but GameWorldRunning()
+         * answers false while menuNow != nullptr, so a menu open still means
+         * stand down) -- and FitGridToMenu was left at u4-grid, BELOW that
+         * gate.  Every container menu froze the world, so the function never
+         * executed while the one menu it targets was on screen: dead code.
+         * Hardware agrees from both sides -- the geode menu grew correctly in
+         * the v539..v617 era (before the stand-down) and stopped growing from
+         * v618 on, which is the "打晶球修好了 / 后来被改走了" pair of reports.
+         *
+         * It is pure memory reads/writes with every pointer range-checked
+         * before use, it ran un-gated through v539..v617 without incident, and
+         * it only ever writes a menu whose layout signature it has matched, so
+         * it is safe on the frames a menu has the world paused.  Nothing else
+         * is being moved out of the gate. */
+        FitGridToMenu();
+
+        if (!hasWorld) {
+            /* v635: keep the draw gate in step with this one.  It used to be
+             * left alone here, which is how it stayed 1 after a save was
+             * closed.
+             *
+             * The two page pointers are cleared for the same reason: the maps
+             * page and the options page are destroyed when their menu closes,
+             * and nothing tells us.  Both are written unconditionally by their
+             * own draw hooks (g_optionsPage = self, s_mapPage = self), and both
+             * are read later by paths that only check "is it non-null" -- a
+             * freed block passes that, keeps its MethodTable, and then hands a
+             * recycled object to code that thinks it is looking at the page it
+             * appended to.  Clearing them on every frame without a world means
+             * no stale page can ever survive a trip back to the title screen. */
+            s_worldAlive = 0;
+            g_optionsPage = nullptr;
+            s_mapPage = nullptr;
+            StMark("m-skip");
+            if (s_origGameUpdate != nullptr) {
+                s_origGameUpdate(self, gameTime);
+            }
+            StMark("m-done");
+            return;
+        }
+        StMark("u0");
+        DiagRightStick();
+        StMark("u1-diag");
+        SuppressStickMenus();
+        StMark("u2-stick");
         EnsureSettings();
+        StMark("u3-cfg");
+        /* v656: FitGridToMenu moved ABOVE the !hasWorld gate -- see the block
+         * before it.  With a container menu open this hook stood down here,
+         * so the call below never executed while the menu it fixes was on
+         * screen. */
+        StMark("u4-grid");
+        /* v542: light the desert mine's own elevator door on entry. */
+        MaybePrepElevator();
+        StMark("u5-elev");
         if (s_saveAskFrame < 0xFFFFu) {
             ++s_saveAskFrame;      /* v379: throttle counter for switch saves */
         }
@@ -20607,24 +24294,43 @@ namespace {
         if (kTractor && !kDiagNoAuto && g_tractorOn != 0) {
             AutoTractorUse();
         }
+        StMark("u6-tractor");
         /* v293: sampled here because the draw path must not call managed code.
          * Game1.get_CurrentEvent is a plain static getter. */
         s_eventActive =
             reinterpret_cast<void* (*)(void*)>(g_base + kGetCurrentEventOff)(nullptr)
                 != nullptr ? 1u : 0u;
+        StMark("u7-event");
         /* v410: same reason -- get_DailyLuck is managed, so the number is
          * taken here (once a second) and the HUD only draws the copy. */
-        if (kHudInfo && g_hudOn != 0) {
-            SampleDailyLuck();
-            /* Once a second is enough to notice an upgrade starting, but the
-             * moment one does the row is drawn immediately while the icon is
-             * still the previous sample's -- which showed the fallback hammer
-             * for up to a second.  While a row is on screen with no sprite
-             * behind it, retry every frame instead. */
-            if (++s_toolFrame >= 60 ||
-                (s_lastUpgradeDays > 0 && s_toolRectValid == 0)) {
-                s_toolFrame = 0;
-                SampleToolUpgrade();
+        /* v540: the HUD and the calendar's gift tooltip share the same
+         * date/season cache (s_wxValid / s_wxSeason / s_wxDay), but only the
+         * HUD used to refresh it.  Switching 左上角信息 off therefore froze that
+         * cache: the calendar hover went dead while 社交 page kept working,
+         * because the social page reads the gift table directly.
+         *
+         * So the sampling below runs while EITHER switch is on; the parts only
+         * the HUD block needs (daily luck, tool upgrade, TV probe, the strings
+         * themselves) stay under the HUD gate. */
+        const bool hudSample = (kHudInfo && g_hudOn != 0);
+        /* v614: and nothing at all while the world is paused behind a menu or
+         * has not been created yet -- see WorldIsRunning(). */
+        const bool worldRunning = WorldIsRunning();
+        s_worldAlive = worldRunning ? 1u : 0u;
+        StMark(worldRunning ? "u8-world" : "u8-idle");
+        if (worldRunning && (hudSample || (kGiftHint && g_giftOn != 0))) {
+            if (hudSample) {
+                SampleDailyLuck();
+                /* Once a second is enough to notice an upgrade starting, but
+                 * the moment one does the row is drawn immediately while the
+                 * icon is still the previous sample's -- which showed the
+                 * fallback hammer for up to a second.  While a row is on
+                 * screen with no sprite behind it, retry every frame instead. */
+                if (++s_toolFrame >= 60 ||
+                    (s_lastUpgradeDays > 0 && s_toolRectValid == 0)) {
+                    s_toolFrame = 0;
+                    SampleToolUpgrade();
+                }
             }
             /* Strings are built here, not in the draw hook: ManagedStr
              * allocates a managed object, and allocating while the game is
@@ -20639,13 +24345,15 @@ namespace {
             /* Phase 4: cache state machine.  Cheap reads every frame; the
              * managed chain runs at most once per day. */
             UpdateWeatherCache();
-            /* Phase 3: the TV's own call sequence, once a second at most.
-             * Managed calls -- update hook only. */
-            if (++s_probeFrame >= 60) {
-                s_probeFrame = 0;
-                RunWeatherProbe();
+            if (hudSample) {
+                /* Phase 3: the TV's own call sequence, once a second at most.
+                 * Managed calls -- update hook only. */
+                if (++s_probeFrame >= 60) {
+                    s_probeFrame = 0;
+                    RunWeatherProbe();
+                }
+                BuildHudStrings();
             }
-            BuildHudStrings();
         }
         /* v486: the crop and machine bubbles are built here, outside the
          * 左上角信息 gate and outside BuildHudStrings(), because they have
@@ -20769,7 +24477,9 @@ namespace {
         /* v337: run after the vanilla update so machine timers have already
          * advanced for this tick -- the same ordering PC Automate uses. */
         if (kAutomate) {
+            StMark("u9-auto-in");
             AutomateTick();
+            StMark("u10-auto-out");
         }
         /* After the game has advanced every sprite, before it draws: this is
          * the only window where the source rect we write will be the one used.
@@ -20781,9 +24491,11 @@ namespace {
         if (kTractor && !kDiagNoAuto && g_tractorOn != 0) {
             MaintainTractorPresence();
         }
+        StMark("u_end");
     }
 
     int HookStringEquals(void* a, void* b) {
+        HIT_NO_WORLD(streq);
         if (kDiagNoStr) {
             return s_origStrEquals != nullptr ? s_origStrEquals(a, b) : 0;
         }
@@ -20829,6 +24541,8 @@ namespace {
      * the original runs exactly once and we only adjust one integer after it
      * returns. */
     void HookShippingUpdate(void* self, void* gameTime) {
+
+        HIT_NO_WORLD(shippingupdate);
         if (s_origShippingUpdate != nullptr) {
             s_origShippingUpdate(self, gameTime);
         }
@@ -20863,6 +24577,7 @@ namespace {
     /* v206 read-side probes.  Both are pass-through, allocation-free and
      * non-blocking -- they run on the boot thread, long before the HUD. */
     void HookReadSettings(void* self, void* reader) {
+        HIT_NO_WORLD(readset);
         if (s_evtRead == 0xFFu) {
             s_evtRead = s_evtSeq & 0xFFu;
         }
@@ -20936,6 +24651,9 @@ namespace {
                         g_giftOn = s_discGift;
                         g_rowOn[kRowCrop] = s_discCrop;
                         g_cropOn = s_discCrop;
+                        /* v656: the bundle row comes from disconnectDay
+                         * bit 28, not from the mask bits. */
+                        g_rowOn[kRowBundle] = s_discBundle;
                         g_tractorOn = g_rowOn[kRowMaster];
                         g_mapOn = g_rowOn[kRowMap];
                     }
@@ -20971,6 +24689,7 @@ namespace {
     }
 
     void HookSetOptions(void* opts) {
+        HIT_NO_WORLD(setopt);
         if (s_evtSetOpt == 0xFFu) {
             s_evtSetOpt = s_evtSeq & 0xFFu;
         }
@@ -21018,7 +24737,28 @@ namespace {
     }
 
     void HookOptionsPageDraw(void* self, void* batch) {
+        HIT_NO_WORLD(optdraw);
         s_origOptionsDraw(self, batch);
+        /* v656: the s_worldAlive gate is GONE, and it takes the ratio row
+         * with it.
+         *
+         * s_worldAlive is owned by the update hook, which stands down while
+         * ANY menu is open (GameWorldRunning() answers false when
+         * menuNow != nullptr).  The mod page IS a menu, so from v637 on this
+         * early return fired on every frame the page was actually on screen:
+         * the falling-edge loop below never ran, a click on the 自动售卖箱 row
+         * toggled the box and nothing else -- no ratio step, no relabel, no
+         * persistence.  That is exactly the "自动售卖机不能换比例了，被改成
+         * 勾选了" regression the user reported for the v1.11 line, and it also
+         * silently disabled the change detector for every other row.
+         *
+         * v639 added this gate for the character-creation screen, where the
+         * hook runs against a long-dead page.  The protection that actually
+         * answers that concern is the PINNING below -- g_appendedTo == self
+         * plus Plausible()/RangeReadable() on every element -- which was
+         * built for precisely that recycled-pointer problem (v312) and is
+         * cleared when the menu dies (the teardown loop nulls g_appendedTo).
+         * The dead page can no longer match, gate or no gate. */
         if (kDiagNoDraw) {
             return;
         }
@@ -21069,11 +24809,32 @@ namespace {
                 }
                 g_rowOn[i] = (*reinterpret_cast<unsigned char*>(
                     reinterpret_cast<unsigned char*>(el) + 0x51) != 0) ? 1u : 0u;
+                if (i == kRowKeep && g_rowOn[i] == 0u) {
+                    /* v524: the row is a button.  A click clears the box and
+                     * that falling edge is the whole signal; put the box back so
+                     * the next click is visible again, then step the ratio. */
+                    g_rowOn[i] = 1u;
+                    *reinterpret_cast<unsigned char*>(
+                        reinterpret_cast<unsigned char*>(el) + 0x51) = 1;
+                    s_keepPct = (s_keepPct >= 100u) ? 0u : (s_keepPct + 25u);
+                    s_keepRelabel = 1u;
+                    s_discDirty = 1;   /* rides the farm save (v533) */
+                    /* v536: a new ratio is applied to whatever is in the
+                     * boxes right now, once.  This is also the manual
+                     * "trim the stock" trigger. */
+                    s_trimSweepReq = 1u;
+                }
             }
             g_tractorOn = g_rowOn[kRowMaster];
             g_mapOn = g_rowOn[kRowMap];
             g_hudOn = g_rowOn[kRowHud];
             g_giftOn = g_rowOn[kRowGift];
+            /* v524: draw the current percentage into the row.  Only when it
+             * actually changed -- this allocates a managed string. */
+            if (s_keepRelabel != 0u) {
+                s_keepRelabel = 0u;
+                RenderKeepLabel(g_ourElems[kRowKeep]);
+            }
 
             /* Stage the values TryPerformSave injects into the serialised copy.
              *
@@ -21108,6 +24869,10 @@ namespace {
                     s_discHud = g_rowOn[kRowHud];
                     s_discGift = g_rowOn[kRowGift];
                     s_discCrop = g_rowOn[kRowCrop];
+                    /* v656: the bundle row mirrors the same way; it persists
+                     * through disconnectDay bit 28 (FlushMaskToDisconnectDay
+                     * reads g_rowOn[kRowBundle] directly). */
+                    s_discBundle = g_rowOn[kRowBundle];
                     /* v469: row 0 is a real switch now; its live state comes
                      * from Options+0x24 (g_rowOn[0] mirrors it every frame). */
                     s_discAnim = g_rowOn[0];
@@ -21118,7 +24883,8 @@ namespace {
                          * kDiscMaskBits, and a bit the loader does not know
                          * about would fail the "is this ours" test and reset
                          * every other switch. */
-                        if (i == kRowHud || i == kRowGift || i == kRowCrop) {
+                        if (i == kRowHud || i == kRowGift || i == kRowCrop ||
+                            i == kRowBundle || i >= kRowKeep) {
                             continue;
                         }
                         if (g_rowOn[i] != 0) {
@@ -22142,7 +25908,7 @@ namespace {
     int   s_wxStable = 0;
     void* s_wxLastPtr = nullptr;
     /* Diagnostic block: one line per item, built in the update hook. */
-    constexpr int kDiagLines = 14;
+    constexpr int kDiagLines = 17;
     CachedStr s_diag[kDiagLines]{};
 
     /* Phase-3 probe result.  Filled in the update hook, formatted into
@@ -22616,6 +26382,75 @@ namespace {
         s_totalDays = (season + 4 * year) * 28 + day - 113;
         s_dateValid = 1;
         s_dateVersion++;
+    }
+
+    /* ---- v611 probe: which object actually sits behind Game1.Date? ----
+     *
+     * SampleDate walks *(0xC95C260) -> netRef -> netRef+0x68 and treats the
+     * result as a WorldDate.  Two independent facts disagree about that
+     * pointer:
+     *
+     *   - the Game1 field table puts `netWorldState`'s storage at 0xC95C260
+     *   - the NetWorldState field table (AOT factory 0x72D34A8, size 0x1F8)
+     *     says a NetWorldState keeps year/season/day at +0x60/+0x68/+0x70 and
+     *     the bundle containers at +0xD0 (bundles), +0xD8 (bundleRewards),
+     *     +0xE0 (netBundleData), +0xE8 (_bundleData cache)
+     *
+     * A WorldDate keeps year/season/day at +0x10/+0x18/+0x20 instead, so the
+     * two shapes are told apart by which triple reads back as a real date.
+     * Print both, once a day, and let the log decide -- no drawing, no writes.
+     * The HUD has been reading dates through this pointer for many versions,
+     * so whatever the answer is, it is already load-bearing. */
+    int s_bpDay = -1;
+
+    void* ReadFieldPtr(void* base, uintptr_t off) {
+        if (base == nullptr) {
+            return nullptr;
+        }
+        unsigned char* p = reinterpret_cast<unsigned char*>(base) + off;
+        if (!RangeReadable(p, 8u)) {
+            return nullptr;
+        }
+        void* v = *reinterpret_cast<void**>(p);
+        return (v != nullptr && Plausible(v)) ? v : nullptr;
+    }
+
+    void ProbeWorldStateShape() {
+        if (s_wxValid == 0 || s_wxYear < 1 || s_wxDay < 1) {
+            return;
+        }
+        const int total = ((s_wxYear - 1) * 4 + s_wxSeason) * 28 + s_wxDay;
+        if (total == s_bpDay) {
+            return;
+        }
+        s_bpDay = total;
+        void** slot =
+            *reinterpret_cast<void***>(g_base + kGame1DateSlotOff);
+        if (slot == nullptr || !Plausible(slot)) {
+            LOGF("bp611: slot unreadable");
+            return;
+        }
+        void* netRef = *slot;
+        void* obj = (netRef != nullptr && Plausible(netRef))
+                        ? ReadFieldPtr(netRef, kNetValueOff)
+                        : nullptr;
+        if (obj == nullptr) {
+            LOGF("bp611: slot=%p netRef=%p obj=null", slot, netRef);
+            return;
+        }
+        const int wdY = WrapperValue(ReadFieldPtr(obj, kWorldDateYearOff));
+        const int wdS = WrapperValue(ReadFieldPtr(obj, kWorldDateSeasonOff));
+        const int wdD = WrapperValue(ReadFieldPtr(obj, kWorldDateDayOff));
+        const int nwY = WrapperValue(ReadFieldPtr(obj, 0x60u));
+        const int nwS = WrapperValue(ReadFieldPtr(obj, 0x68u));
+        const int nwD = WrapperValue(ReadFieldPtr(obj, 0x70u));
+        void* bundles = ReadFieldPtr(obj, 0xD0u);
+        void* bRewards = ReadFieldPtr(obj, 0xD8u);
+        void* netBData = ReadFieldPtr(obj, 0xE0u);
+        void* cacheData = ReadFieldPtr(obj, 0xE8u);
+        LOGF("bp611: obj=%p wd=%d/%d/%d nws=%d/%d/%d b=%p br=%p nbd=%p cache=%p",
+             obj, wdY, wdS, wdD, nwY, nwS, nwD, bundles, bRewards, netBData,
+             cacheData);
     }
 
     /* A static int behind one slot pointer: *(*(base+off)).  Game1.get_Date
@@ -23592,6 +27427,504 @@ namespace {
         }
     }
 
+    /* ---- v610: Queen of Sauce, "she is airing something you do not know" ----
+     *
+     * TV.getWeeklyRecipe is the authority, but it cannot be asked: on a
+     * Wednesday it writes team.queenOfSauceRerunWeek, and either day it ADDS
+     * the recipe to cookingRecipes while answering -- asking would destroy the
+     * very thing being asked about.  So the two halves are done here instead:
+     *
+     *   which week    (daysPlayed % 224) / 7, and 32 when that is 0
+     *   which recipe  Data/TV/CookingChannel, baked in (cooking_channel.hpp)
+     *   already known Game1.player.cookingRecipes.ContainsKey(recipe)
+     *
+     * The dictionary is NetStringDictionary<int,NetInt> at Farmer+0x1F0; its
+     * inner Dictionary<string,NetInt> is at +0x58, and ContainsKey is
+     * 0x12D6F00.  Both offsets and the address come from TV.getWeeklyRecipe's
+     * own codegen (`ldr x8,[x0,#0x1f0]` / `ldr x0,[x8,#0x58]` / `bl`), i.e.
+     * the ones the game itself uses.  Calling that ContainsKey on a different
+     * TValue instantiation is harmless: it touches buckets, entries and the
+     * comparer, never a value.
+     *
+     * daysPlayed is deliberately not read.  Game1.stats.DaysPlayed lives behind
+     * a stat-key dictionary, while Game1.newDay does `dayOfMonth++;
+     * stats.DaysPlayed++;` in the same breath -- so it always equals
+     * WorldDate.TotalDays, which the HUD already tracks as year/season/day.
+     *
+     * Wednesday is a rerun: getRerunWeek() picks a week the player does not
+     * know out of weeks 1..min((daysPlayed-3)/7, 32), so "at least one of those
+     * is unknown" answers the same question -- with an early exit that makes a
+     * typical Wednesday cost one lookup instead of 32.
+     *
+     * Everything here is update-phase only: the draw reads s_qosShow and
+     * nothing else.
+     */
+    constexpr uintptr_t kFarmerCookingRecipesOff = 0x1F0u;
+    constexpr uintptr_t kNetStringDictInnerOff   = 0x58u;
+    constexpr uintptr_t kDictContainsKeyOff =
+        SDV_OFF(kDictContainsKeyOff, 0x12D6F00u);
+    constexpr bool kQosIcon = true;
+
+    int      s_qosKey = -1;      /* TotalDays the answer was computed for */
+    int      s_qosShow = 0;      /* 1 = draw the row */
+    unsigned s_qosFrame = 0;     /* recheck counter while the row is up */
+    /* v623: which week's dish is on show, or -1.  The name string is built in
+     * BuildHudStrings from this, not here: see the note there. */
+    int      s_qosPicked = -1;
+    int      s_qosTextKey = -1;  /* week the cached name was built for */
+    CachedStr s_qosLine{nullptr, 0, 0};
+    /* v612: the badge is the dish, not a TV.  s_qosSheet is resolved in the
+     * update phase because the game's own source-rect helper calls
+     * Texture2D.get_Width; a null sheet (product not on the item sheet) makes
+     * the draw fall back to the generated TV glyph. */
+    void*    s_qosSheet = nullptr;
+    int      s_qosX = 0;
+    int      s_qosY = 0;
+    int      s_qosProduct = -1;
+
+    bool CookingRecipeKnown(const char* name) {
+        if (name == nullptr || *name == 0) {
+            return false;
+        }
+        void* pl = CarryPlayer();
+        if (pl == nullptr || !RangeReadable(
+                reinterpret_cast<unsigned char*>(pl) +
+                    kFarmerCookingRecipesOff, 8u)) {
+            return false;
+        }
+        void* rec = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(pl) + kFarmerCookingRecipesOff);
+        if (rec == nullptr || !Plausible(rec) ||
+            !RangeReadable(reinterpret_cast<unsigned char*>(rec) +
+                               kNetStringDictInnerOff, 8u)) {
+            return false;
+        }
+        void* dict = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(rec) + kNetStringDictInnerOff);
+        if (dict == nullptr || !Plausible(dict)) {
+            return false;
+        }
+        char16_t buf[32];
+        int len = 0;
+        while (name[len] != 0 && len < 31) {
+            buf[len] = static_cast<char16_t>(
+                static_cast<unsigned char>(name[len]));
+            ++len;
+        }
+        if (len == 0) {
+            return false;
+        }
+        void* loc = SafeCurrentLocation();
+        if (loc == nullptr || !Plausible(loc)) {
+            return false;
+        }
+        void* key = nullptr;
+        if (!BuildAsciiStr(loc, buf, len, &key)) {
+            return false;
+        }
+        auto contains = reinterpret_cast<bool (*)(void*, void*)>(
+            g_base + kDictContainsKeyOff);
+        return contains(dict, key);
+    }
+
+    /* ---- v629: is the item in my hand still wanted by a bundle? ----
+     *
+     * Two sources, both read-only.  The baked table answers "which bundle,
+     * which slot, how many, what quality"; NetWorldState.bundles answers
+     * "is that slot already filled".  Nothing here writes to the save.
+     *
+     * The table is sorted by (item id, quality asc, bundle key), so walking
+     * an item's rows in order starts at the bundle with the loosest quality
+     * requirement -- the one the player can satisfy with whatever they
+     * happened to pick up.  A slot that is already filled is skipped; when
+     * every row for that item is filled, the row simply does not appear.
+     *
+     * The three-way result of BundleSlotFilled matters:
+     *   1  filled          -> skip this bundle
+     *   0  empty           -> show this bundle
+     *  -1  cannot tell     -> show it (a wrong "still needed" is harmless;
+     *                         hiding a bundle that is actually needed is not) */
+    constexpr bool kBundleHint = true;
+    int      s_bundleShow = 0;        /* 1 = draw the row */
+    int      s_bundleName = -1;       /* index into sdbundle::kBundleInfo */
+    int      s_bundleQty = 0;         /* how many that slot asks for */
+    int      s_bundleQuality = 0;     /* 0 any, 1 silver, 2 gold */
+    int      s_bundleItem = -1;       /* the item id the row was built from */
+    /* v650: the row now carries the held item's own sprite, the same way the
+     * Queen-of-Sauce row carries the dish.  Resolved in the update phase and
+     * cached, so the draw hook never calls into the game's sprite lookup. */
+    int      s_bundleSprite = -1;
+    void*    s_bundleSheet = nullptr;
+    int      s_bundleX = 0;
+    int      s_bundleY = 0;
+    int      s_bundleTextKey = -1;    /* signature s_bundleLine was built from */
+    unsigned s_bundleWarmup = 0;      /* frames waited since the world appeared */
+    CachedStr s_bundleLine{nullptr, 0, 0};
+
+    int s_bundleDbgOnce = 0;          /* one shape dump per session */
+    int s_bundleCallLog = 0;          /* one "call ok" line per session */
+    int s_bundleWhy = 0;              /* first reason the row was skipped */
+    /* v653: frame counter for the throttle at the top of SampleBundleHint. */
+    unsigned s_bundleTick = 0;
+    /* v654: one place to hide the row, so the early exits can't forget a field. */
+    void ClearBundleHint() {
+        s_bundleShow = 0;
+        s_bundleSheet = nullptr;
+        s_bundleSprite = -1;
+    }
+    int BundleSlotFilled(void* nws, int key, int slot) {
+        void* dict = ReadFieldPtr(nws, kBundleDictOff);
+        if (dict == nullptr) {
+            return -1;
+        }
+        /* THREE arguments, not two.
+         *
+         * The thunk at 0x6268964 starts with `mov x20,x2`, calls
+         * Dictionary.TryGetValue, and on "absent" branches straight to
+         * `mov x0,x20; ret` -- i.e. x2 IS the value returned when the key is
+         * missing.  Passing only (this, key) leaves x2 holding whatever the
+         * caller happened to have in that register, which would hand back a
+         * garbage pointer that later looks readable.  Passing an explicit
+         * nullptr makes "absent" mean exactly what it should: nothing filled.
+         *
+         * This is also why GetValueOrDefault is used instead of the indexer:
+         * the indexer throws KeyNotFoundException for a bundle the save has
+         * never touched, and an exception unwinding through the update hook
+         * skips the rest of the frame (the v464 lesson). */
+        auto getOrDefault = reinterpret_cast<void* (*)(void*, int, void*)>(
+            g_base + kBundleGetOrDefaultOff);
+        void* v = getOrDefault(dict, key, nullptr);
+        if (v == nullptr) {
+            return 0;      /* key absent -> no slot of this bundle is filled */
+        }
+        if (!Plausible(v)) {
+            return -1;
+        }
+        /* The thunk converts TField to TValue before returning, so what comes
+         * back is either a NetArray<bool,NetBool> (one more indirection) or a
+         * raw bool[].  A bundle has at most 12 slots, so a raw array's object
+         * header ends well before +0x58 while a NetArray keeps its backing
+         * pointer there -- check both the pointer and the length behind it,
+         * and fall through to the raw-array reading if either looks wrong. */
+        void* backing = ReadFieldPtr(v, kNetArrayBackingOff);
+        if (backing != nullptr) {
+            unsigned char* lenCell =
+                reinterpret_cast<unsigned char*>(backing) + kArrayLenOff;
+            if (RangeReadable(lenCell, 4u)) {
+                const int len = *reinterpret_cast<int*>(lenCell);
+                if (len > 0 && len <= 32) {
+                    if (slot < 0 || slot >= len) {
+                        return -1;
+                    }
+                    auto getAt =
+                        reinterpret_cast<unsigned char (*)(void*, int)>(
+                            g_base + kNetArrayBoolGetOff);
+                    const int r = getAt(v, slot) != 0 ? 1 : 0;
+                    if (s_bundleDbgOnce == 0) {
+                        s_bundleDbgOnce = 1;
+                        LOGM("bundle dbg: netarray v=%p len=%d slot=%d r=%d",
+                             v, len, slot, r);
+                    }
+                    return r;
+                }
+            }
+        }
+        /* Raw bool[]: length at +0x18 and the bytes immediately after. */
+        unsigned char* rawLen =
+            reinterpret_cast<unsigned char*>(v) + kArrayLenOff;
+        if (!RangeReadable(rawLen, 4u)) {
+            return -1;
+        }
+        const int rawN = *reinterpret_cast<int*>(rawLen);
+        if (rawN <= 0 || rawN > 32) {
+            return -1;
+        }
+        if (slot < 0 || slot >= rawN) {
+            return -1;
+        }
+        unsigned char* data = reinterpret_cast<unsigned char*>(v) + 0x20;
+        if (!RangeReadable(data, static_cast<size_t>(slot) + 1u)) {
+            return -1;
+        }
+        const int rr = data[slot] != 0 ? 1 : 0;
+        if (s_bundleDbgOnce == 0) {
+            s_bundleDbgOnce = 1;
+            LOGM("bundle dbg: rawarray v=%p len=%d slot=%d r=%d", v, rawN,
+                 slot, rr);
+        }
+        return rr;
+    }
+
+    void SampleBundleHint() {
+        /* v654: the warm-up counter has to advance once per real frame.
+         *
+         * v653 put the throttle first, which made the warm-up tick only every
+         * 10th frame -- 240 ticks turned into 2400 frames (40 s), so the row
+         * simply did not appear for the first 40 seconds after entering a
+         * world.  That is exactly what "献祭物品不显示了" looked like.
+         *
+         * Order is now: enabled -> warm-up -> throttle -> sample.  The
+         * throttle still runs the managed chain at most every 10 frames
+         * (0.17 s) and still leaves the previous answer on screen while it
+         * waits, but it can no longer slow anything that counts frames. */
+        if (!kBundleHint) {
+            ClearBundleHint();
+            return;
+        }
+        /* v656: the 献祭物品提示 row on the mod page.  Default is on, so a
+         * save written by an older build (no bit 28) behaves exactly as
+         * before. */
+        if (s_discBundle == 0u) {
+            ClearBundleHint();
+            return;
+        }
+        if (s_bundleWarmup < 240u) {
+            if (++s_bundleWarmup == 240u) {
+                LOGM("bundle: warmup done");
+            }
+            ClearBundleHint();
+            return;
+        }
+        /* v653: at most every 10 frames.  BuildHudStrings() is called from the
+         * per-frame update hook, and looking up an item's bundles means one
+         * GetValueOrDefault per slot -- a managed call whose thunk converts
+         * TField to TValue (boxing in the worst case).  A 12-slot bundle used
+         * to cost up to 720 managed calls a second; the answer only changes
+         * when the held item or the bundle state does.  Returning early keeps
+         * the previous answer visible. */
+        if (++s_bundleTick < 10u) {
+            return;
+        }
+        s_bundleTick = 0;
+        ClearBundleHint();
+        void* pl = CarryPlayer();
+        if (pl == nullptr || !Plausible(pl)) {
+            return;
+        }
+        /* v631: this used to be an unconditional get_CurrentItem call, and it
+         * is what froze the console in v630.  The getter's own codegen runs
+         *
+         *     ldr x8, [x19, #0x4e8]     ; player->netItemStowed
+         *     ldr x0, [x8, #0x68]       ; <- no null check on x8
+         *     cbz x0, <the other path>
+         *
+         * and later `ldr x8,[x19,#0x4e0]` (currentToolIndex) with the same
+         * shape.  During the handful of frames right after a save loads those
+         * containers are still null, so the getter dereferences null: that is
+         * a hardware fault, not a managed exception -- the process dies where
+         * it stands, the audio thread keeps playing, and HOME does nothing.
+         * Exactly the v630 report.
+         *
+         * So the two fields it is about to touch are checked here first, and
+         * the whole row waits out a short warm-up after a load.  A missing row
+         * for five seconds costs nothing; a dead console costs a lot. */
+        /* v654: the warm-up now runs at the top of this function (see there);
+         * what follows is the field check the warm-up exists for. */
+        if (!RangeReadable(reinterpret_cast<unsigned char*>(pl) + 0x4E8u, 8u)) {
+            if (s_bundleWhy == 0) {
+                s_bundleWhy = 1;
+                LOGM("bundle: skip 4e8 unreadable pl=%p", pl);
+            }
+            return;
+        }
+        if (*reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(pl) + 0x4E8u) == nullptr) {
+            if (s_bundleWhy == 0) {
+                s_bundleWhy = 2;
+                LOGM("bundle: skip temporaryItem null pl=%p", pl);
+            }
+            return;
+        }
+        if (!RangeReadable(reinterpret_cast<unsigned char*>(pl) + 0x4E0u, 8u)) {
+            if (s_bundleWhy == 0) {
+                s_bundleWhy = 3;
+                LOGM("bundle: skip 4e0 unreadable pl=%p", pl);
+            }
+            return;
+        }
+        if (*reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(pl) + 0x4E0u) == nullptr) {
+            if (s_bundleWhy == 0) {
+                s_bundleWhy = 4;
+                LOGM("bundle: skip currentToolIndex null pl=%p", pl);
+            }
+            return;
+        }
+        auto getItem =
+            reinterpret_cast<void* (*)(void*)>(g_base + kFarmerCurrentItemOff);
+        void* item = getItem(pl);
+        if (item == nullptr || !Plausible(item)) {
+            if (s_bundleWhy == 0) {
+                s_bundleWhy = 5;
+                LOGM("bundle: skip item=%p pl=%p", item, pl);
+            }
+            return;
+        }
+        if (s_bundleCallLog == 0) {
+            s_bundleCallLog = 1;
+            LOGM("bundle: call ok pl=%p item=%p", pl, item);
+        }
+        /* v657: objects only -- "(W)4"/"(H)66" must not read as 4/66 here. */
+        const int id = BundleIngredientId(item);
+        if (id < 0) {
+            return;
+        }
+        int lo = 0;
+        int hi = sdbundle::kIndexCount - 1;
+        int hit = -1;
+        while (lo <= hi) {
+            const int mid = (lo + hi) >> 1;
+            const int k = sdbundle::kItemIndex[mid].itemId;
+            if (k == id) {
+                hit = mid;
+                break;
+            }
+            if (k < id) {
+                lo = mid + 1;
+            }
+            else {
+                hi = mid - 1;
+            }
+        }
+        if (hit < 0) {
+            return;      /* not a bundle ingredient at all */
+        }
+        void* slotRef =
+            *reinterpret_cast<void**>(g_base + kNetWorldStateSlotOff);
+        void* nws = ReadFieldPtr(slotRef, kNetValueOff);
+        if (nws == nullptr) {
+            return;
+        }
+        const sdbundle::ItemIndex& ix = sdbundle::kItemIndex[hit];
+        for (int i = 0; i < ix.count; i++) {
+            const sdbundle::BundleItem& bi =
+                sdbundle::kBundleItem[ix.first + i];
+            if (BundleSlotFilled(nws, sdbundle::kBundleInfo[bi.bundle].key,
+                                 bi.slot) == 1) {
+                continue;
+            }
+            s_bundleShow = 1;
+            s_bundleName = bi.bundle;
+            s_bundleQty = bi.qty;
+            s_bundleQuality = bi.quality;
+            s_bundleItem = id;
+            /* v650: parentSheetIndex is a plain int at Item+0x68.  The item id
+             * used for the table lookup is usually the same number, but not
+             * always (flavoured/quality variants), so read the real field and
+             * fall back to the id only if it is unreadable. */
+            int sprite = id;
+            if (RangeReadable(reinterpret_cast<unsigned char*>(item) +
+                                  kItemParentSheetOff, 4u)) {
+                const unsigned raw = *reinterpret_cast<unsigned*>(
+                    reinterpret_cast<unsigned char*>(item) +
+                    kItemParentSheetOff);
+                if (raw < 4096u) {
+                    sprite = static_cast<int>(raw);
+                }
+            }
+            s_bundleSprite = sprite;
+            if (!ResolveIconRect(0, sprite, &s_bundleSheet, &s_bundleX,
+                                 &s_bundleY)) {
+                s_bundleSheet = nullptr;
+            }
+            return;
+        }
+    }
+
+    void SampleQueenOfSauce() {
+        if (!kQosIcon) {
+            return;
+        }
+        /* Nothing to say until the date is settled, and the answer only
+         * changes on a day boundary -- except that learning the recipe while
+         * the icon is up has to take it away, so the visible state is
+         * rechecked slowly.  A hidden state is not rechecked at all. */
+        if (s_wxValid == 0 || s_wxYear < 1 || s_wxDay < 1) {
+            return;
+        }
+        const int total = ((s_wxYear - 1) * 4 + s_wxSeason) * 28 + s_wxDay;
+        const int prevShow = s_qosShow;
+        bool dayChanged = false;
+        if (total != s_qosKey) {
+            s_qosKey = total;
+            s_qosFrame = 0;
+            dayChanged = true;
+        }
+        else if (s_qosShow == 0) {
+            return;
+        }
+        else if (++s_qosFrame < 15u) {
+            return;
+        }
+        else {
+            s_qosFrame = 0;
+            /* v628: cheap gate before the full rescan.
+             *
+             * The only thing that can change while the row is up is that the
+             * player learnt THIS week's dish -- watching the show is what adds
+             * it.  One ContainsKey answers that; the expensive path (up to 32
+             * lookups on a Wednesday) only runs when it says yes.  That is what
+             * lets the row disappear 15 frames after the recipe is learnt
+             * instead of after four seconds. */
+            if (s_qosPicked >= 0 && s_qosPicked <= 32 &&
+                !CookingRecipeKnown(kCookingChannelRecipe[s_qosPicked])) {
+                return;
+            }
+        }
+
+        s_qosShow = 0;
+        int picked = -1;
+        const int dow = s_wxDay % 7;      /* 0 Sun, 3 Wed (Game1.shortDayName) */
+        if (dow == 0) {
+            int week = (total % 224) / 7;
+            if (total % 224 == 0) {
+                week = 32;
+            }
+            if (week >= 0 && week <= 32) {
+                picked = week;
+                s_qosShow = CookingRecipeKnown(kCookingChannelRecipe[week])
+                                ? 0 : 1;
+            }
+        }
+        else if (dow == 3) {
+            int weeks = (total - 3) / 7;
+            if (weeks > 32) {
+                weeks = 32;
+            }
+            for (int week = 1; week <= weeks; week++) {
+                if (!CookingRecipeKnown(kCookingChannelRecipe[week])) {
+                    s_qosShow = 1;
+                    picked = week;
+                    break;
+                }
+            }
+        }
+        /* One line per day, plus any change of mind (watching the show is what
+         * adds the recipe, so the icon has to be able to go away): the badge is
+         * an inference, and the first hardware run has to be able to say which
+         * week it believed and which recipe it looked up. */
+        /* v612: resolve the dish's 16x16 cell once per answer, here in the
+         * update phase -- kGetSquareRectOff is the game's own
+         * getSourceRectForStandardTileSheet, which asks Texture2D for its
+         * width, so it cannot run inside the draw hook. */
+        s_qosProduct = -1;
+        s_qosSheet = nullptr;
+        if (s_qosShow != 0 && picked >= 0 && picked <= 32) {
+            s_qosProduct = kCookingChannelProduct[picked];
+            if (!ResolveIconRect(0, s_qosProduct, &s_qosSheet, &s_qosX,
+                                 &s_qosY)) {
+                s_qosSheet = nullptr;
+            }
+        }
+        /* v623: which week's dish to show.  The name is built in
+         * BuildHudStrings -- this function only decides. */
+        s_qosPicked = s_qosShow != 0 ? picked : -1;
+        if (dayChanged || s_qosShow != prevShow) {
+            LOGF("qos: day=%d dow=%d week=%d show=%d id=%d", total, dow, picked,
+                 s_qosShow, s_qosProduct);
+        }
+    }
+
     void BuildHudStrings() {
         if (!kHudInfo) {
             return;
@@ -23776,6 +28109,44 @@ namespace {
             snprintf(tmp, sizeof(tmp), "crop d=%d f=%x r=%u",
                      s_cropDays, s_cropFlags, s_cropDbg);
             DiagLine(13, tmp);
+            /* v534 DIAG (temporary): the auto sell box.
+             *   s = how many registered chests IsSellBox() accepts
+             *   r = keep ratio in percent
+             *   w = palette white as the GAME returns it
+             *   p = nearest chest's playerChoiceColor
+             *   t = nearest chest's tint */
+            snprintf(tmp, sizeof(tmp), "box s=%u r=%u w=%08x p=%08x t=%08x",
+                     s_dbgSellCount, s_keepPct, WhitePack(),
+                     s_dbgChestPick, s_dbgChestTint);
+            DiagLine(14, tmp);
+            /* v536 DIAG (temporary): the trimmer itself.
+             *   sw   = a sweep is pending (first run, or the ratio changed)
+             *   crf  = items this pass where the clone could not be made
+             *   cat  = items skipped because they are equipment
+             *   last = id/stack/sold of the last item that was trimmed */
+            snprintf(tmp, sizeof(tmp), "trim sw=%u crf=%u cat=%u cl=%u last=%d/%d/%d",
+                     s_trimSweep, s_trimDbgCrf, s_trimDbgCat, s_trimCleared,
+                     s_trimDbgId, s_trimDbgN, s_trimDbgSell);
+            DiagLine(15, tmp);
+            /* v542: the desert mine's elevator.  lvl = the level parsed out of
+             * the location name, nm = its length (-1 = unreadable) and the two
+             * characters it starts with, ls = 1 when the level came from the
+             * name; spot = the door the game's prepareElevator found (-1,-1
+             * means the level's map has no elevator tile). */
+            {
+                const char srcChar = s_elevSrc == 1 ? 'm'
+                                   : s_elevSrc == 2 ? 'o'
+                                   : s_elevSrc == 3 ? '-'
+                                   : s_elevSrc == 4 ? 'n'
+                                   : s_elevSrc == 5 ? 'v'
+                                   : s_elevSrc == 6 ? 'x' : '?';
+                snprintf(tmp, sizeof(tmp), "elev lvl=%d nm=%d/%c%c ls=%d sp=%d,%d s=%c",
+                         s_elevDbgLevel, s_elevNmLen,
+                         (s_elevNmChar0 >= 32 && s_elevNmChar0 < 127) ? s_elevNmChar0 : '.',
+                         (s_elevNmChar1 >= 32 && s_elevNmChar1 < 127) ? s_elevNmChar1 : '.',
+                         s_elevLvlSrc, s_elevSpotX, s_elevSpotY, srcChar);
+            }
+            DiagLine(16, tmp);
             /* The probe-D line used to be drawn here.  The probe is compiled
              * out for good (see docs/RETROSPECTIVE_ACTIVE_SAVE.md), so the row
              * only ever showed a frozen "ps=0" -- one line of noise on every
@@ -23923,6 +28294,99 @@ namespace {
             buf[n] = 0;
             CachedStrBuild(&s_luckLine, buf, n);
         }
+
+        /* v610: the Queen of Sauce badge.  Here rather than next to the draw
+         * because it calls into managed code (ContainsKey), and this function
+         * is the update-phase half of the module. */
+        SampleQueenOfSauce();
+        /* v623: the dish name, built here with the other HUD rows and rechecked
+         * whenever this function runs.
+         *
+         * v622 built it once, at the moment the answer changed, and kept it.
+         * That string has no GC root: a collection between the update hook and
+         * the draw hook frees it, CachedStrOk() then fails, and the row draws
+         * its sprite with no name beside it -- exactly what the first hardware
+         * run showed.  Weather, luck, birthday and the gift hint have always
+         * rebuilt here for the same reason; this row now does too.
+         *
+         * Must stay above the tool-upgrade block below, which returns early
+         * when nothing is being upgraded. */
+        if (kQosIcon && s_qosShow != 0 && s_qosPicked >= 0 &&
+            s_qosPicked <= 32) {
+            if (s_qosTextKey != s_qosPicked || !CachedStrOk(s_qosLine)) {
+                s_qosTextKey = s_qosPicked;
+                static const char16_t kPrefix[] = u"酱料女皇 ";
+                char16_t buf[32];
+                int n = 0;
+                for (int i = 0; kPrefix[i] != 0 && n < 31; i++) {
+                    buf[n++] = kPrefix[i];
+                }
+                const char16_t* dish = kCookingChannelName[s_qosPicked];
+                for (int i = 0; dish[i] != 0 && n < 31; i++) {
+                    buf[n++] = dish[i];
+                }
+                buf[n] = 0;
+                CachedStrBuild(&s_qosLine, buf, n);
+            }
+        }
+        else {
+            s_qosTextKey = -1;
+        }
+        /* v629: Community Center row.  Built here, next to every other HUD
+         * row, because a CachedStr built once and held has no GC root -- the
+         * v622 lesson (icon drawn, text gone).  Rebuilt only when the answer
+         * changes: a different item in hand, or a different bundle for the
+         * same item.  Placed before the tool-upgrade block below, which
+         * returns early when nothing is upgrading. */
+        SampleBundleHint();
+        if (s_bundleShow != 0 && s_bundleName >= 0 &&
+            s_bundleName < sdbundle::kBundleCount) {
+            const int key = s_bundleItem * 64 + s_bundleName;
+            if (key != s_bundleTextKey || !CachedStrOk(s_bundleLine)) {
+                s_bundleTextKey = key;
+                char16_t buf[56];
+                int n = 0;
+                static const char16_t kHead[] = u"献祭物品要求 ";
+                for (int i = 0; kHead[i] != 0 && n < 40; i++) {
+                    buf[n++] = kHead[i];
+                }
+                if (s_bundleQuality == 1) {
+                    buf[n++] = u'银';
+                    buf[n++] = u' ';
+                }
+                else if (s_bundleQuality == 2) {
+                    buf[n++] = u'金';
+                    buf[n++] = u' ';
+                }
+                const char16_t* nm = sdbundle::kBundleInfo[s_bundleName].name;
+                for (int i = 0; nm[i] != 0 && n < 48; i++) {
+                    buf[n++] = nm[i];
+                }
+                /* v652: back to the plain "0 / required" form, as v629 had
+                 * it.  The v651 slot counter was correct but the user asked
+                 * for the original presentation, so the extra tripel walks
+                 * and the extra state are gone too. */
+                buf[n++] = u' ';
+                buf[n++] = u'0';
+                buf[n++] = u'/';
+                n = AppendUnsigned(buf, n, s_bundleQty);
+                buf[n] = 0;
+                CachedStrBuild(&s_bundleLine, buf, n);
+                /* One line per change of answer: the ids are what tells a
+                 * wrong table row from a wrong donation bit. */
+                LOGM("bundle: id=%d bi=%d q=%d n=%d", s_bundleItem,
+                     s_bundleName, s_bundleQuality, s_bundleQty);
+            }
+        }
+        else {
+            if (s_bundleTextKey != -1) {
+                LOGM("bundle: none (id=%d)", s_bundleItem);
+            }
+            s_bundleTextKey = -1;
+        }
+        /* v611: one line a day, pure read, decides the WorldDate-vs-
+         * NetWorldState question the bundle feature depends on. */
+        ProbeWorldStateShape();
 
         /* Tool upgrade countdown.  s_lastUpgradeDays is only the "does this row
          * exist" flag the draw path reads; s_upgradeShown is what the string
@@ -24218,10 +28682,57 @@ namespace {
                       s_machQuality, s_machNextQ);
     }
 
+    /* v566: the mine draws its floor number in the top-left corner -- the exact
+     * corner this block starts in, so the badge was hidden behind the weather
+     * row.  Inside a mine (the SkullCavern entrance room or any mine level) the
+     * whole block moves down by one row pitch; everywhere else nothing moves,
+     * because on the surface that corner is empty and top-left is where the
+     * player expects it.
+     *
+     * The location pointer is cached: DrawHud runs every frame and the name
+     * only changes when the player Warps. */
+    static void* s_hudLoc = nullptr;
+    static int s_hudInMine = 0;
+
+    bool InMineForHud() {
+        void* loc = SafeCurrentLocation();
+        if (loc != s_hudLoc) {
+            s_hudLoc = loc;
+            s_hudInMine = 0;
+            void* str = LocNameStr(loc);
+            if (str != nullptr) {
+                const int len = ManagedStrLen(str);
+                static const char16_t kMine[15] = {
+                    u'U', u'n', u'd', u'e', u'r', u'g', u'r', u'o', u'u',
+                    u'n', u'd', u'M', u'i', u'n', u'e'};
+                static const char16_t kSkull[9] = {
+                    u'S', u'k', u'u', u'l', u'l', u'C', u'a', u'v', u'e'};
+                if (len >= 15 && len <= 24 && NameHasPrefix(str, kMine, 15)) {
+                    s_hudInMine = 1;
+                }
+                else if (len == 9 && NameHasPrefix(str, kSkull, 9)) {
+                    s_hudInMine = 1;
+                }
+            }
+        }
+        return s_hudInMine != 0;
+    }
+
+
     void DrawHudInfo() {
         if (!kHudInfo || g_hudOn == 0) {
             return;
         }
+        /* v567: the INFO rows are not drawn in a mine -- the mine's floor badge
+         * owns that corner, and weather/luck/birthday are surface information.
+         *
+         * v568: the diagnostic block is exempt.  It starts at kHudDiagY (256,
+         * below the flowing list), nowhere
+         * near the badge, and while an elevator is being chased it is the only
+         * way to read the detector's state on the console.  v567 returned
+         * early, which hid the diagnostics too and made "look at the rg= field"
+         * advice impossible to follow. */
+        const bool hideInfo = InMineForHud();
         /* Nothing here may allocate: every string below was built in the
          * update hook.  DrawHudString ignores a null or implausible object.
          *
@@ -24234,36 +28745,46 @@ namespace {
          * skipping it is a crash at exactly the moments that allocate hardest
          * -- opening the menu, loading a save.  The diagnostic lines have
          * always done this; the four info lines did not. */
-        if (CachedStrOk(s_weatherLine)) {
-            DrawHudString(s_weatherLine.obj, kHudTextX, kHudTextY, 0xFFFFFFFFu);
-        }
-        /* Our own art, encoded as filled rectangles: no texture to load.
-         * The slot is null until that icon has been drawn, so a missing
-         * icon simply shows the text alone instead of drawing garbage. */
-        /* Same slot the text was built from, not a fresh read of the
-         * field -- otherwise the icon shows the base weather while the
-         * text shows the corrected one. */
-        const int idx = s_weatherSlot;
-        if (idx >= 0 && idx < kWeatherIconCount &&
-            kWeatherIcons[idx].count > 0) {
-            void* white =
-                *reinterpret_cast<void**>(g_base + kStaminaRectOff);
-            if (Plausible(white)) {
-                DrawIconRuns(white, kWeatherIcons[idx].runs,
-                             kWeatherIcons[idx].count,
-                             kHudIconX, kHudIconY, kHudIconScale);
-            }
-        }
-
+        /* v624: row-major fill again -- but the gift hint is no longer an item.
+         *
+         * Three rounds got here, and each failure was a different one:
+         *   v621  fixed slots -> empty gaps above filled rows.
+         *   v622  row-major, gift hint as its own cell -> the hint sat beside
+         *         the birthday, which is not where anyone reads it.
+         *   v623  two independent columns -> the hint is back under the name,
+         *         but the left column was now a fixed lane, so the right
+         *         column's empty cell below the luck row stayed empty forever.
+         *
+         * What both requirements actually want: the birthday block ("who, and
+         * what do they like") is ONE item, and everything else is filled
+         * row-major into whichever cell comes next.  Because the hint lives
+         * inside the birthday item (drawn at +50, still within the 80px step),
+         * the block only consumes one step -- so the next row lands in the
+         * right column beside it, exactly like any other item would.
+         *
+         * Order: luck, weather, birthday(+hint), tool upgrade, queen of sauce.
+         * Luck and weather exist every day, so they pin (0,0) and (0,1).
+         * v627 swapped the two: luck first, weather second. */
+        const int rowY0 = kHudRowY;
+        int slot = 0;
+        int cx = 0;
+        int cy = 0;
+        auto take = [&](int* px, int* py) {
+            const int row = slot >> 1;
+            *px = ((slot & 1) == 0) ? kHudIconX : kHudCol1X;
+            *py = rowY0 + row * kHudFlowPitch;
+            ++slot;
+        };
 
         /* Daily luck.  Icon comes from the game's own cursor sheet -- the same
          * 10x14 region UI Info Suite 2 uses -- tinted by tier so the colour
          * answers the question before you read the number. */
-        if (CachedStrOk(s_luckLine)) {
-            DrawHudString(s_luckLine.obj, kHudCol1X + 72, kHudLuckTextY,
-                          0xFFFFFFFFu);
+        take(&cx, &cy);                   /* cell 0: daily luck */
+        if (!hideInfo && CachedStrOk(s_luckLine)) {
+            DrawHudString(s_luckLine.obj, static_cast<float>(cx + 72),
+                          static_cast<float>(cy + 20), 0xFFFFFFFFu);
         }
-        {
+        if (!hideInfo) {
             void* batch =
                 *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
             void* cursors =
@@ -24286,11 +28807,15 @@ namespace {
                  * die sits 12px above the text's centre line.  Measured off a
                  * screenshot: text centre y=125, die centre y=113.  Nudge the
                  * destination down by that much so the die looks centred. */
+                /* The row0-relative offsets this used to be built from
+                 * (kHudLuckX/Y) are now derived from the slot; the +4 centres
+                 * the 56px-tall die in the 64px band and kHudLuckArtDy cancels
+                 * the transparent rows under the art (see above). */
                 const u64 dxy =
                     (static_cast<u64>(
-                         static_cast<u32>(kHudLuckY + kHudLuckArtDy))
+                         static_cast<u32>(cy + 4 + kHudLuckArtDy))
                      << 32) |
-                    static_cast<u32>(kHudLuckX);
+                    static_cast<u32>(cx + 12);
                 const u64 dwh =
                     (static_cast<u64>(static_cast<u32>(ih)) << 32) |
                     static_cast<u32>(iw);
@@ -24301,6 +28826,30 @@ namespace {
                            1.0f, 0);
             }
         }
+        take(&cx, &cy);                   /* cell 1: weather */
+        if (!hideInfo && CachedStrOk(s_weatherLine)) {
+            DrawHudString(s_weatherLine.obj, static_cast<float>(cx + 72),
+                          static_cast<float>(cy + 20), 0xFFFFFFFFu);
+        }
+        /* Our own art, encoded as filled rectangles: no texture to load.
+         * The slot is null until that icon has been drawn, so a missing
+         * icon simply shows the text alone instead of drawing garbage. */
+        /* Same slot the text was built from, not a fresh read of the
+         * field -- otherwise the icon shows the base weather while the
+         * text shows the corrected one. */
+        const int idx = s_weatherSlot;
+        if (!hideInfo && idx >= 0 && idx < kWeatherIconCount &&
+            kWeatherIcons[idx].count > 0) {
+            void* white =
+                *reinterpret_cast<void**>(g_base + kStaminaRectOff);
+            if (Plausible(white)) {
+                DrawIconRuns(white, kWeatherIcons[idx].runs,
+                             kWeatherIcons[idx].count, cx, cy,
+                             kHudIconScale);
+            }
+        }
+
+
 
         if (kHudRawProbe) {
             for (int i = 0; i < kDiagLines; i++) {
@@ -24316,21 +28865,25 @@ namespace {
                     continue;
                 }
                 DrawHudString(s_diag[i].obj, kHudTextX,
-                              232.0f + static_cast<float>(i) * 18.0f,
+                              kHudDiagY + static_cast<float>(i) * 18.0f,
                               0xFFFFFF00u);
             }
         }
 
-        /* Second row.  The tool row owns the left slot, so the birthday takes
-         * the right column while an upgrade is running and moves back to the
-         * left when it is not -- that way each row still lines up with the
-         * column above it. */
-        const int bdayRowY = kHudRow1Y;                       /* 100 */
-        const int bdayColX = s_lastUpgradeDays > 0 ? kHudCol1X : kHudIconX;
+        if (hideInfo) {
+            return;                 /* birthday / gift / tool are info rows too */
+        }
+
+        /* birthday portrait + name.  One step in the left column; the gift
+         * hint is drawn inside this same block (below), which is why the two
+         * travel together. */
+        int bdayRowY = 0;
+        int bdayColX = 0;
         /* The head is 16x15 at 4x (64x60), read from the character's own
          * sheet every frame -- a cached texture pointer would go stale the
          * moment the game reloads one, and drawing a dead texture is a crash. */
         if (s_bdayShow != 0) {
+            take(&bdayColX, &bdayRowY);
             if (s_bdayBaked != 0) {
                 void* white = *reinterpret_cast<void**>(
                     g_base + kStaminaRectOff);
@@ -24395,67 +28948,245 @@ namespace {
             }
         }
 
-        /* Gift hint sits on its own row: the birthday row already shares its
-         * width with the portrait and the tool column, and a gift name is
-         * longer than a person's name.  Same colour as every other HUD row --
-         * a dimmer one read as a different kind of text rather than as part of
-         * the same block (user, 2026-11-10). */
-        if (g_giftOn != 0 && s_giftShow != 0 && CachedStrOk(s_giftLine)) {
-            DrawHudString(s_giftLine.obj, kHudTextX,
-                          static_cast<float>(bdayRowY + 50), 0xFFFFFFFFu);
-        }
-
-
-        /* Tool upgrade countdown: only when something is actually upgrading. */
-        if (s_lastUpgradeDays <= 0) {
-            return;
-        }
-        void* batch = *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
-        void* font = *reinterpret_cast<void**>(g_base + kGame1SmallFontOff);
-        if (!Plausible(batch) || !Plausible(font)) {
-            return;
-        }
-        /* The tool's own sprite when we have it, our hammer otherwise.  Both
-         * are drawn 64x64 so the row keeps its size either way. */
-        int drew = 0;
-        if (s_toolRectValid != 0 && Plausible(s_toolSheet)) {
-            NullableRect src;
-            src.x = s_toolRectX;
-            src.y = s_toolRectY;
-            src.w = s_toolRectW;
-            src.h = s_toolRectH;
-            src.present = 1;
-            for (int q = 0; q < 7; q++) {
-                src.pad[q] = 0;
-            }
-            const u64 dxy =
-                (static_cast<u64>(static_cast<u32>(kHudToolY)) << 32) |
-                static_cast<u32>(kHudToolX);
-            const u64 dwh =
-                (static_cast<u64>(static_cast<u32>(64)) << 32) |
-                static_cast<u32>(64);
-            auto drawSprite =
-                reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
-            drawSprite(batch, s_toolSheet, dxy, dwh, &src, 0xFFFFFFFFu,
-                       0.0f, 0.0f, 0.0f, 1.0f, 0);
-            drew = 1;
-        }
-        if (drew == 0 && kHud_tool.count > 0) {
-            void* white = *reinterpret_cast<void**>(g_base + kStaminaRectOff);
-            if (Plausible(white)) {
-                DrawIconRuns(white, kHud_tool.runs, kHud_tool.count,
-                             kHudToolX, kHudToolY, kHudToolScale);
+        /* The gift hint is its own cell: it is longer than a person's name and
+         * the birthday cell already carries a portrait plus text.  It only
+         * exists on days someone has a birthday, so in the flow it always lands
+         * right after that row.  Same colour as every other HUD row -- a dimmer
+         * one read as a different kind of text rather than as part of the same
+         * block (user, 2026-11-10). */
+        /* The gift hint belongs to the birthday block: it answers "what does
+         * that person like", so it sits directly under the name, in the same
+         * column, and consumes no step of its own.  v622 give it its own cell
+         * and it ended up beside the birthday on the right -- which is not
+         * where anyone reads it.  +50 puts it just under the name line, inside
+         * the 80px block, so the next row still starts on the pitch. */
+        if (g_giftOn != 0 && s_giftShow != 0 && s_bdayShow != 0) {
+            if (CachedStrOk(s_giftLine)) {
+                DrawHudString(s_giftLine.obj,
+                              static_cast<float>(bdayColX + 72),
+                              static_cast<float>(bdayRowY + 50),
+                              0xFFFFFFFFu);
             }
         }
-        if (!CachedStrOk(s_upgradeLine)) {
-            return;
+
+        /* Tool upgrade countdown -- only while something is actually being
+         * upgraded.  Right column, under the luck row: both are status, where
+         * the left column is people.  It used to sit in a dead-end tail below
+         * everything else and returned early; now it is one step in the flow. */
+        if (s_lastUpgradeDays > 0) {
+            int tX = 0;
+            int tY = 0;
+            take(&tX, &tY);
+            void* batch =
+                *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
+            void* font =
+                *reinterpret_cast<void**>(g_base + kGame1SmallFontOff);
+            if (Plausible(batch) && Plausible(font)) {
+                /* The tool's own sprite when we have it, our hammer otherwise.
+                 * Both are drawn 64x64 so the row keeps its size either way. */
+                int drew = 0;
+                if (s_toolRectValid != 0 && Plausible(s_toolSheet)) {
+                    NullableRect src;
+                    src.x = s_toolRectX;
+                    src.y = s_toolRectY;
+                    src.w = s_toolRectW;
+                    src.h = s_toolRectH;
+                    src.present = 1;
+                    for (int q = 0; q < 7; q++) {
+                        src.pad[q] = 0;
+                    }
+                    const u64 dxy =
+                        (static_cast<u64>(static_cast<u32>(tY)) << 32) |
+                        static_cast<u32>(tX);
+                    const u64 dwh =
+                        (static_cast<u64>(static_cast<u32>(64)) << 32) |
+                        static_cast<u32>(64);
+                    auto drawSprite =
+                        reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
+                    drawSprite(batch, s_toolSheet, dxy, dwh, &src, 0xFFFFFFFFu,
+                               0.0f, 0.0f, 0.0f, 1.0f, 0);
+                    drew = 1;
+                }
+                if (drew == 0 && kHud_tool.count > 0) {
+                    void* white = *reinterpret_cast<void**>(
+                        g_base + kStaminaRectOff);
+                    if (Plausible(white)) {
+                        DrawIconRuns(white, kHud_tool.runs, kHud_tool.count,
+                                     tX, tY, kHudToolScale);
+                    }
+                }
+                if (CachedStrOk(s_upgradeLine)) {
+                    DrawHudString(s_upgradeLine.obj,
+                                  static_cast<float>(tX + 72),
+                                  static_cast<float>(tY + 20), 0xFFFFFFFFu);
+                }
+            }
         }
-        DrawHudString(s_upgradeLine.obj, kHudTextX, kHudToolTextY,
-                      0xFFFFFFFFu);
+
+        /* 5: Queen of Sauce airing a recipe this player does not know yet.
+         * v612: the badge IS the dish.  v622: it is a full row now -- same 64px
+         * sprite as the weather and tool icons (16x16 cell at 4x, not the 2x it
+         * used to get) and the dish's name beside it, so the badge answers both
+         * "is today worth turning the TV on" and "which dish is it".
+         * s_qosSheet was resolved in the update phase; if the product is not on
+         * the item sheet the generated TV glyph stands in at the same size, so
+         * the reminder never disappears over a sprite lookup. */
+        if (kQosIcon && s_qosShow != 0) {
+            int qX = 0;
+            int qY = 0;
+            take(&qX, &qY);
+            void* qosBatch =
+                *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
+            if (s_qosSheet != nullptr && Plausible(s_qosSheet) &&
+                Plausible(qosBatch)) {
+                NullableRect src;
+                src.x = s_qosX;
+                src.y = s_qosY;
+                src.w = 16;
+                src.h = 16;
+                src.present = 1;
+                for (int q = 0; q < 7; q++) {
+                    src.pad[q] = 0;
+                }
+                /* 16x16 at 4x = 64x64, the size of every other icon in this
+                 * block.  2x matched nothing and read as a stray badge. */
+                constexpr int kQosPixels = 64;
+                const u64 dxy =
+                    (static_cast<u64>(static_cast<u32>(qY)) << 32) |
+                    static_cast<u32>(qX);
+                const u64 dwh =
+                    (static_cast<u64>(static_cast<u32>(kQosPixels)) << 32) |
+                    static_cast<u32>(kQosPixels);
+                auto drawSprite =
+                    reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
+                drawSprite(qosBatch, s_qosSheet, dxy, dwh, &src, 0xFFFFFFFFu,
+                           0.0f, 0.0f, 0.0f, 1.0f, 0);
+            }
+            else {
+                void* white =
+                    *reinterpret_cast<void**>(g_base + kStaminaRectOff);
+                if (Plausible(white)) {
+                    /* kHud_qos is a 32x32 glyph, so kHudIconScale (2x) already
+                     * lands on 64 and matches the dish sprite above. */
+                    DrawIconRuns(white, kHud_qos.runs, kHud_qos.count,
+                                 qX, qY, kHudIconScale);
+                }
+            }
+            if (CachedStrOk(s_qosLine)) {
+                DrawHudString(s_qosLine.obj, static_cast<float>(qX + 72),
+                              static_cast<float>(qY + 20), 0xFFFFFFFFu);
+            }
+        }
+        /* v629: Community Center row, always the LAST cell of the flow.
+         *
+         * That position is deliberate twice over.  It means an item change
+         * cannot shift any row above it -- switching tools in the hotbar was
+         * going to push the whole block up and down otherwise.  And it means
+         * the text may run past the second column's x: there is nothing to
+         * the right of the last cell, so a 6-character bundle name
+         * ("异国情调采集") is free to extend instead of being clipped.
+         *
+         * v650: it now has an icon -- the held item's own 16x16 sprite at 4x,
+         * exactly like the Queen-of-Sauce row draws the dish.  v629 left it
+         * text-only on the theory that the hotbar already showed the item, but
+         * in the top-left block a row without a 64x64 icon reads as broken
+         * alignment, not as a deliberate omission.  The text still starts at
+         * cell + 72 so the column's left edge stays straight. */
+        if (kBundleHint && s_bundleShow != 0 && CachedStrOk(s_bundleLine)) {
+            int bx = 0;
+            int by = 0;
+            take(&bx, &by);
+            if (s_bundleSheet != nullptr && Plausible(s_bundleSheet)) {
+                void* batch =
+                    *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
+                if (Plausible(batch)) {
+                    NullableRect src;
+                    src.x = s_bundleX;
+                    src.y = s_bundleY;
+                    src.w = 16;
+                    src.h = 16;
+                    src.present = 1;
+                    for (int q = 0; q < 7; q++) {
+                        src.pad[q] = 0;
+                    }
+                    constexpr int kPixels = 64;
+                    const u64 dxy =
+                        (static_cast<u64>(static_cast<u32>(by)) << 32) |
+                        static_cast<u32>(bx);
+                    const u64 dwh =
+                        (static_cast<u64>(static_cast<u32>(kPixels)) << 32) |
+                        static_cast<u32>(kPixels);
+                    auto drawSprite =
+                        reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
+                    drawSprite(batch, s_bundleSheet, dxy, dwh, &src,
+                               0xFFFFFFFFu, 0.0f, 0.0f, 0.0f, 1.0f, 0);
+                }
+            }
+            DrawHudString(s_bundleLine.obj, static_cast<float>(bx + 72),
+                          static_cast<float>(by + 20), 0xFFFFFFFFu);
+        }
+
     }
 
     void HookDrawHud(void* self) {
-        SyncFastFromOptions(self);
+
+        HIT_NO_WORLD(drawhud);
+        if (kStageTrace) {
+            sdlog::LineForce("st d0 f=%u a=%u", s_stFrame, s_worldAlive);
+        }
+        const bool hasWorld = WorldIsRunning();
+        /* v637: this only needs to run while the startup-preference snapshot is
+         * still being taken, plus any time a world exists.
+         *
+         * g_startupPrefs is a captured wrapper the game frees shortly after boot
+         * (v202/v204 notes).  LooksLikeStartupPrefs() reads through it, and by
+         * the character-creation screen that block has been recycled -- reading
+         * it every frame there is exactly the kind of use-after-free this file
+         * has been bitten by twice already.  s_snapOk goes to 1 within the first
+         * few frames, so the capture window is unaffected. */
+        if (hasWorld || s_snapOk == 0) {
+            SyncFastFromOptions(self);
+        }
+        /* v635: nothing else of ours runs without a world.
+         *
+         * The v616 gate covered only the three draw calls, and it read
+         * s_worldAlive -- which the UPDATE hook owns.  v618/v619 made update
+         * stand down behind a menu, so on the character-creation screen that
+         * flag kept the 1 it had when the previous save was still open, and the
+         * gate never closed.  Everything still ran:
+         *
+         *   MaybeGrowBackpack()   grows the player's item list through the
+         *                         game's own routine -- there is no player;
+         *   the checkbox block    allocates managed strings (PadLeft, Substring)
+         *                         against g_optionsPage, a page instance that
+         *                         died when the save was closed; this is the
+         *                         exact "managed string with no GC root while
+         *                         the world is paused" path the v492 note left
+         *                         as a suspect for the animal-naming freeze;
+         *   the three draw calls  paint textures cached in the update phase,
+         *                         i.e. pointers from the closed save.
+         *
+         * The v634 log pins the freeze to this screen with update already
+         * asleep (gate: menu=1 world=0, three lines, then nothing), so the draw
+         * hook is the only code of ours left that can be running.
+         *
+         * SyncFastFromOptions above stays: it is a pure read with a fingerprint
+         * check, and it has to run from the first frame of the process or the
+         * preferences we serialise later are constructor defaults.
+         *
+         * One line every 300 frames answers the remaining question -- whether
+         * this hook is called at all on that screen (it prints nothing if it
+         * is not, which would put the freeze outside this module). */
+        if (!hasWorld) {
+            g_optionsPage = nullptr;     /* the page it pointed at is gone */
+            s_worldAlive = 0;
+            static unsigned s_drawHoldTick = 0;
+            if ((++s_drawHoldTick % 300u) == 0u) {
+                LOGM("draw: hold f=%u", s_stFrame);
+            }
+            s_origDrawHud(self);
+            return;
+        }
         MaybeGrowBackpack();
 
         /* The checkbox needs no syncing from us any more: with whichOption =
@@ -24551,8 +29282,8 @@ namespace {
                                 reinterpret_cast<unsigned char*>(wrapper) +
                                 0x10);
                             if (capPtr != nullptr &&
-                                RangeReadable(capPtr, 4u) && buf != nullptr &&
-                                Plausible(buf)) {
+                                RangeReadable(capPtr, 4u) &&
+                                ListRangeOk(buf, cnt + 1)) {
                                 const int cap = *reinterpret_cast<int*>(capPtr);
                                 if (cap > cnt) {
                                     reinterpret_cast<void**>(buf)[cnt] = elem;
@@ -24598,14 +29329,31 @@ namespace {
          * when it returns is not something this code can see, and drawing into
          * a closed batch throws a managed exception.  Before the call the
          * batch is definitely open. */
-        DrawHudInfo();
-        /* v448: outside DrawHudInfo on purpose -- the crop label is its own
-         * feature and must still appear when the HUD switch is off. */
-        DrawCropLabel(*reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff));
-        /* v454: the machine label is a separate feature (no switch of its own
-         * yet -- the preferences int has no free bit left). */
-        DrawMachineLabel(*reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff));
+        /* v616: nothing of ours is drawn until a world exists.
+         *
+         * drawHUD is called with a SpriteBatch already begun, and the three
+         * calls below hand that batch textures taken from the UPDATE phase's
+         * caches (tool cell, crop cell, machine cell, dish cell).  v614 stopped
+         * that phase from running while a menu is up or no world exists -- but
+         * the draw side kept drawing last session's pointers, and a
+         * SpriteBatch.Draw with a texture the GPU queue cannot resolve is a
+         * console freeze, not a managed exception: the picture stops, the
+         * audio thread keeps playing, and the HOME menu does not come back.
+         * The gate is a plain static read, which is all the draw phase is
+         * allowed to do. */
+        if (s_worldAlive != 0) {
+            DrawHudInfo();
+            /* v448: outside DrawHudInfo on purpose -- the crop label is its own
+             * feature and must still appear when the HUD switch is off. */
+            DrawCropLabel(*reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff));
+            /* v454: the machine label is a separate feature (no switch of its own
+             * yet -- the preferences int has no free bit left). */
+            DrawMachineLabel(*reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff));
+        }
         s_origDrawHud(self);
+        if (kStageTrace) {
+            sdlog::LineForce("st d1 f=%u", s_stFrame);
+        }
         if (kDiagNoDraw) {
             return;
         }
@@ -24628,6 +29376,8 @@ namespace {
      * is the guard that keeps this from firing on a layout it does not match.
      */
     void HookBillboardHover(void* self, int mx, int my) {
+
+        HIT_NO_WORLD(billboardhover);
         if (s_origBillboardHover != nullptr) {
             s_origBillboardHover(self, mx, my);
         }
@@ -24966,8 +29716,12 @@ namespace {
     /* Draw the social page's gift tooltip, after the game's own draw so the
      * panel lands on top of the portrait row. */
     void HookSocialDraw(void* self, void* batch) {
+        HIT_NO_WORLD(social);
         if (s_origSocialDraw != nullptr) {
             s_origSocialDraw(self, batch);
+        }
+        if (s_worldAlive == 0) {
+            return;
         }
         if (!kGiftHint || g_giftOn == 0) {
             return;
@@ -25060,8 +29814,12 @@ namespace {
     }
 
     void HookBillboardDraw(void* self, void* batch) {
+        HIT_NO_WORLD(billboard);
         if (s_origBillboardDraw != nullptr) {
             s_origBillboardDraw(self, batch);
+        }
+        if (s_worldAlive == 0) {
+            return;
         }
         if (s_calDay < 1 || s_calDay > 28 || s_wxValid == 0) {
             return;
@@ -25118,6 +29876,10 @@ namespace nn::ro::detail {
 extern "C" void exl_main(void* x0, void* x1) {
     (void)x0;
     (void)x1;
+
+    /* v648: publish the ring magic before the first LOGF, so an overlay that
+     * attaches while the game is still booting can already find and export it. */
+    ringlog::Init(kBuildNo);
 
     /* Volatile stores: they keep g_timeRequest alive through --gc-sections
      * (nothing else references it yet) and put the slot in a known state. */
@@ -25202,6 +29964,10 @@ extern "C" void exl_main(void* x0, void* x1) {
         { 0x0120AE00u, 0xD101C3FFu, 0x6D0223E9u },
         { 0x01213260u, 0xA9BE7BFDu, 0xA9014FF4u },
         { 0x01217960u, 0xD10343FFu, 0xA9097BFDu },
+        { 0x01696A40u, 0xD10183FFu, 0xA9017BFDu },
+        { 0x01501600u, 0x6DB923E9u, 0xA9017BFDu },
+        { 0x01477AD0u, 0xA9BE7BFDu, 0xA9014FF4u },
+        { 0x01466070u, 0xA9BC7BFDu, 0xF9000BF7u },
         { 0x014500A0u, 0xD10543FFu, 0xA9107BFDu },
         { 0x003943F0u, 0x17FFFFA4u, 0x00000000u },
         { 0x0181D1F0u, 0xD10683FFu, 0x6D1133EDu },
@@ -25285,6 +30051,8 @@ extern "C" void exl_main(void* x0, void* x1) {
     if (kTractor && kTractorActive) {
         s_origPressUseTool = reinterpret_cast<bool (*)()>(
             HOOKF(base + kPressUseToolOff, &HookPressUseTool, true));
+        LOGF("tractor: pressUseTool hook %p",
+             reinterpret_cast<void*>(s_origPressUseTool));
     }
     /* stage 2: widen the tool's area of effect while riding the tractor. */
     if (kTractor && kTractorActive) {
@@ -25326,6 +30094,53 @@ extern "C" void exl_main(void* x0, void* x1) {
             HOOKF(base + kShippingBinUpdateOff, &HookShippingBinUpdate, true));
         LOGF("automate: shipping bin hook %p",
              reinterpret_cast<void*>(s_origBinUpdate));
+    }
+
+    /* v553: Ginger Island maps do not inherit the vanilla "A rides a horse"
+     * branch, so each island override needs the same wrapper. */
+    if (kTractor && g_tractorOn != 0) {
+        static const uintptr_t kIslandOff[4] = {
+            SDV_OFF(kIsland0, 0x1650400u), SDV_OFF(kIsland1, 0x1654C10u),
+            SDV_OFF(kIsland2, 0x165DCC0u), SDV_OFF(kIsland3, 0x1668B60u)};
+        for (int i = 0; i < 4; i++) {
+            s_origIslandCheck[i] =
+                reinterpret_cast<IslandCheckActionFn>(HOOKF(
+                    base + kIslandOff[i], &HookIslandCheckAction, true));
+            LOGF("tractor: island checkAction %d hook %p", i,
+                 reinterpret_cast<void*>(s_origIslandCheck[i]));
+        }
+    }
+
+    /* v541: the Skull Cavern elevator hangs on the level's ladder, so
+     * MineShaft.checkAction has to be able to intercept it. */
+    if (kSkullElevator) {
+        s_origMineCheckAction = reinterpret_cast<MineCheckActionFn>(
+            HOOKF(base + kMineCheckActionOff, &HookMineCheckAction, true));
+        LOGF("elevator: checkAction hook %p",
+             reinterpret_cast<void*>(s_origMineCheckAction));
+        /* v571/v572: and the base one, for the entrance room -- off until the
+         * door itself is proven, see kEntranceClick.  The HOOKF stays in the
+         * source (and in the probe table) either way. */
+        if (kEntranceClick) {
+            s_origLocCheckAction = reinterpret_cast<LocCheckActionFn>(
+                HOOKF(base + kLocCheckActionOff, &HookLocCheckAction, true));
+            LOGF("elevator: location checkAction hook %p",
+                 reinterpret_cast<void*>(s_origLocCheckAction));
+        }
+        /* v601: the menu's "0" button.  Vanilla's click handler calls
+         * Game1.enterMine(Convert.ToInt32(name)), so this is where "go back to
+         * the entrance room" has to be implemented. */
+        s_origEnterMine = reinterpret_cast<EnterMineFn>(
+            HOOKF(base + kEnterMineOff, &HookEnterMine, true));
+        LOGF("elevator: enterMine hook %p",
+             reinterpret_cast<void*>(s_origEnterMine));
+        /* v602: button "0" never reaches enterMine -- 1.6 warps straight to the
+         * valley mine from receiveLeftClick's zero branch.  This is the overload
+         * that branch calls, so this is where the redirect has to live. */
+        s_origMineWarp = reinterpret_cast<MineWarpFn>(
+            HOOKF(base + kMineWarpOff, &HookMineWarp0, true));
+        LOGF("elevator: mineWarp hook %p",
+             reinterpret_cast<void*>(s_origMineWarp));
     }
 
     /* stage 2c: per-frame auto tool use while driving.

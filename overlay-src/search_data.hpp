@@ -1868,6 +1868,508 @@ constexpr const char* kSearchKeys[] = {
     "wucaishangyi wcsy prismaticshirt", // (S)1999 五彩上衣
     "mizhishangyi mzsy mysteryshirt",  // (S)MysteryShirt 谜之上衣
     "putongtaotoushannan ptttsn basicpulloverm", // (S)SoftEdgePullover 普通套头衫（男）
+    "yijiejingshi yjjs farawaystone",  // (O)FarAwayStone 异界晶石
+    "kalikesanhuadan klkshd calicoegg",  // (O)CalicoEgg 卡利科三花蛋
+    "hunhehuahuizhongzi hhhhzz mixedflowerseeds",  // (O)MixedFlowerSeeds 混合花卉种子
+    "huangjinfupiao hjfp goldenbobber",  // (O)GoldenBobber 黄金浮漂
+    "mizhihe mzh mysterybox",  // (O)MysteryBox 谜之盒
+    "huangjinbiaoqian hjbq goldentag",  // (O)TroutDerbyTag 黄金标签
+    "gaojiyuer gjye deluxebait",  // (O)DeluxeBait 高级鱼饵
+    "taixian tx moss",  // (O)Moss 苔藓
+    "zhangmantaixiandezhongzi zmtxdzz mossyseed",  // (O)MossySeed 长满苔藓的种子
+    "shengnafupiao snfp sonarbobber",  // (O)SonarBobber 声纳浮漂
+    "yuer ye bait",  // (O)SpecificBait 鱼饵
+    "bianxiezhangpeng bxzp tentkit",  // (O)TentKit 便携帐篷
+    "shenmishuzhong smsz mystictreeseed",  // (O)MysticTreeSeed 神秘树种
+    "shenmitangjiang smtj mysticsyrup",  // (O)MysticSyrup 神秘糖浆
+    "putaogan ptg raisins",  // (O)Raisins 葡萄干
+    "dried",  // (O)DriedFruit Dried
+    "dried",  // (O)DriedMushrooms Dried
+    "xingzhiguocha xzgc stardroptea",  // (O)StardropTea 星之果茶
+    "duijiangquan djq prizeticket",  // (O)PrizeTicket 兑奖券
+    "jinbi jb goldcoin",  // (O)GoldCoin 金币
+    "baocangtuteng bctt treasuretotem",  // (O)TreasureTotem 宝藏图腾
+    "tiaozhanyuer tzye challengebait",  // (O)ChallengeBait 挑战鱼饵
+    "huluobozhongzi hlbzz carrotseeds",  // (O)CarrotSeeds 胡萝卜种子
+    "huluobo hlb carrot",  // (O)Carrot 胡萝卜
+    "jinpixihuluzhongzi jpxhlzz summersquashseeds",  // (O)SummerSquashSeeds 金皮西葫芦种子
+    "jinpixihulu jpxhl summersquash",  // (O)SummerSquash 金皮西葫芦
+    "xilanhuazhongzi xlhzz broccoliseeds",  // (O)BroccoliSeeds 西蓝花种子
+    "xilanhua xlh broccoli",  // (O)Broccoli 西蓝花
+    "shuangguazhongzi sgzz powdermelonseeds",  // (O)PowdermelonSeeds 霜瓜种子
+    "shuanggua sg powdermelon",  // (O)Powdermelon 霜瓜
+    "smoked",  // (O)SmokedFish Smoked
+    "jinsemizhihe jsmzh goldenmysterybox",  // (O)GoldenMysteryBox 金色谜之盒
+    "hainingjiao hnj seajelly",  // (O)SeaJelly 海凝胶
+    "dongxueningjiao dxnj cavejelly",  // (O)CaveJelly 洞穴凝胶
+    "heningjiao hnj riverjelly",  // (O)RiverJelly 河凝胶
+    "xiahuyu xhy goby",  // (O)Goby 虾虎鱼
+    "hudiefen hdf butterflypowder",  // (O)ButterflyPowder 蝴蝶粉
+    "chongwusiyangzheng cwsyz petlicense",  // (O)PetLicense 宠物饲养证
+    "lansecaozi lscz bluegrassstarter",  // (O)BlueGrassStarter 蓝色草籽
+    "taixiantang txt mosssoup",  // (O)MossSoup 苔藓汤
+    "jiajuzhiwu jjzw houseplant",  // (BC)0 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)1 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)2 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)3 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)4 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)5 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)6 家居植物
+    "jiajuzhiwu jjzw houseplant",  // (BC)7 家居植物
+    "daocaoren dcr scarecrow",  // (BC)8 稻草人
+    "bileizhen blz lightningrod",  // (BC)9 避雷针
+    "fengfang ff beehouse",  // (BC)10 蜂房
+    "xiaotong xt keg",  // (BC)12 小桶
+    "ronglu rl furnace",  // (BC)13 熔炉
+    "guantouping gtp preservesjar",  // (BC)15 罐头瓶
+    "yalaoji ylj cheesepress",  // (BC)16 压酪机
+    "zhibuji zbj loom",  // (BC)17 织布机
+    "chanyouji cyj oilmaker",  // (BC)19 产油机
+    "huishouji hsj recyclingmachine",  // (BC)20 回收机
+    "baoshifuzhiji bsfzj crystalarium",  // (BC)21 宝石复制机
+    "zhuozibujianzuo zzbjz tablepiecel",  // (BC)22 桌子部件（左）
+    "zhuozibujianyou zzbjy tablepiecer",  // (BC)23 桌子部件（右）
+    "danhuangjiangji dhjj mayonnaisemachine",  // (BC)24 蛋黄酱机
+    "zhongzishengchanqi zzscq seedmaker",  // (BC)25 种子生产器
+    "muyi my woodchair",  // (BC)26 木椅
+    "muyi my woodchair",  // (BC)27 木椅
+    "gujiamoxing gjmx skeletonmodel",  // (BC)28 骨架模型
+    "fangjianbei fjb obelisk",  // (BC)29 方尖碑
+    "jidiaoxiang jdx chickenstatue",  // (BC)31 鸡雕像
+    "shidui sd stonecairn",  // (BC)32 石堆
+    "zhuangjia zj suitofarmor",  // (BC)33 装甲
+    "chuanbiao cb signofthevessel",  // (BC)34 船标
+    "putongyuanmu ptym basiclog",  // (BC)35 普通圆木
+    "caopinghuolieniao cphln lawnflamingo",  // (BC)36 草坪火烈鸟
+    "mupai mp woodsign",  // (BC)37 木牌
+    "shipai sp stonesign",  // (BC)38 石牌
+    "shensepaizi sspz darksign",  // (BC)39 深色牌子
+    "dalvzhang dlz biggreencane",  // (BC)40 大绿杖
+    "lvzhang lz greencanes",  // (BC)41 绿杖
+    "hunsezhang hsz mixedcane",  // (BC)42 混色杖
+    "hongzhang hz redcanes",  // (BC)43 红杖
+    "dahongzhang dhz bigredcane",  // (BC)44 大红杖
+    "zhuangshigancaokun zsgck ornamentalhaybale",  // (BC)45 装饰干草捆
+    "yuanmuduan ymd logsection",  // (BC)46 圆木段
+    "mushi ms gravestone",  // (BC)47 墓石
+    "jijiexingzhuangshi jjxzs seasonaldecor",  // (BC)48 季节性装饰
+    "shiwa sw stonefrog",  // (BC)52 石蛙
+    "shiyingwu syw stoneparrot",  // (BC)53 石鹦鹉
+    "shimaotouying smty stoneowl",  // (BC)54 石猫头鹰
+    "shizhunimo sznm stonejunimo",  // (BC)55 石祝尼魔
+    "shilaimuqiu slmq slimeball",  // (BC)56 史莱姆球
+    "huapen hp gardenpot",  // (BC)62 花盆
+    "shujia sj bookcase",  // (BC)64 书架
+    "piaoliangdezhuozi pldzz fancytable",  // (BC)65 漂亮的桌子
+    "yuanguzhuozi ygzz ancienttable",  // (BC)66 远古桌子
+    "yuangudengzi ygdz ancientstool",  // (BC)67 远古凳子
+    "zufudezhong zfdz grandfatherclock",  // (BC)68 祖父的钟
+    "taidixiongnaozhong tdxnz teddytimer",  // (BC)69 泰迪熊闹钟
+    "kusideshu ksds deadtree",  // (BC)70 枯死的树
+    "louti lt staircase",  // (BC)71 楼梯
+    "gaogaodehuoba ggdhb talltorch",  // (BC)72 高高的火把
+    "yishimianju ysmj ritualmask",  // (BC)73 仪式面具
+    "gouhuo gh bonfire",  // (BC)74 篝火
+    "xiaoshougu xsg bongo",  // (BC)75 小手鼓
+    "zhuangshizhangmao zszm decorativespears",  // (BC)76 装饰长矛
+    "yuanshi ys boulder",  // (BC)78 圆石
+    "men m door",  // (BC)79 门
+    "men m door",  // (BC)80 门
+    "shangsuodemen ssdm lockeddoor",  // (BC)81 上锁的门
+    "shangsuodemen ssdm lockeddoor",  // (BC)82 上锁的门
+    "xieediaoxiang xedx wickedstatue",  // (BC)83 邪恶雕像
+    "xieediaoxiang xedx wickedstatue",  // (BC)84 邪恶雕像
+    "shulangujiazuo slgjz slothskeletonl",  // (BC)85 树懒骨架（左）
+    "shulangujiazhong slgjz slothskeletonm",  // (BC)86 树懒骨架（中）
+    "shulangujiayou slgjy slothskeletonr",  // (BC)87 树懒骨架（右）
+    "zhilidejingdong zldjd standinggeode",  // (BC)88 直立的晶洞
+    "heiyaoshihuaping hyshp obsidianvase",  // (BC)89 黑曜石花瓶
+    "changgedeshitou cgdst singingstone",  // (BC)94 唱歌的石头
+    "shimaotouying smty stoneowl",  // (BC)95 石猫头鹰
+    "qiguaidejiaonang qgdjn strangecapsule",  // (BC)96 奇怪的胶囊
+    "kongzhidejiaonang kzdjn emptycapsule",  // (BC)98 空置的胶囊
+    "weiliaodou wld feedhopper",  // (BC)99 喂料斗
+    "fuhuaqi fhq incubator",  // (BC)101 孵化器
+    "jiareqi jrq heater",  // (BC)104 加热器
+    "shuyecaijiqi sycjq tapper",  // (BC)105 树液采集器
+    "xiangji xj camera",  // (BC)106 相机
+    "rongmaotuzi rmtz plushbunny",  // (BC)107 绒毛兔子
+    "yicuxianhua ycxh tuboflowers",  // (BC)108 一簇鲜花
+    "zhenqiwuya zqwy rarecrow",  // (BC)110 珍奇乌鸦
+    "zhuangshipingzi zspz decorativepitcher",  // (BC)111 装饰瓶子
+    "fenggantaiyanghua fgtyh driedsunflowers",  // (BC)112 风干太阳花
+    "zhenqiwuya zqwy rarecrow",  // (BC)113 珍奇乌鸦
+    "meitanyao mty charcoalkiln",  // (BC)114 煤炭窑
+    "xingluguyingxiongjiangbei xlgyxjb stardewherotrophy",  // (BC)116 星露谷英雄奖杯
+    "qishuiji qsj sodamachine",  // (BC)117 汽水机
+    "mutong mt barrel",  // (BC)118 木桶
+    "muxiang mx crate",  // (BC)119 木箱
+    "mutong mt barrel",  // (BC)120 木桶
+    "muxiang mx crate",  // (BC)121 木箱
+    "mutong mt barrel",  // (BC)122 木桶
+    "muxiang mx crate",  // (BC)123 木箱
+    "mutong mt barrel",  // (BC)124 木桶
+    "muxiang mx crate",  // (BC)125 木箱
+    "zhenqiwuya zqwy rarecrow",  // (BC)126 珍奇乌鸦
+    "wujincaifuzhidiaoxiang wjcfzdx statueofendlessfortune",  // (BC)127 无尽财富之雕像
+    "moguhezi mghz mushroombox",  // (BC)128 蘑菇盒子
+    "baoxiang bx chest",  // (BC)130 宝箱
+    "zhenqiwuya zqwy rarecrow",  // (BC)136 珍奇乌鸦
+    "zhenqiwuya zqwy rarecrow",  // (BC)137 珍奇乌鸦
+    "zhenqiwuya zqwy rarecrow",  // (BC)138 珍奇乌鸦
+    "zhenqiwuya zqwy rarecrow",  // (BC)139 珍奇乌鸦
+    "zhenqiwuya zqwy rarecrow",  // (BC)140 珍奇乌鸦
+    "caoyuanzhiwangjiejixitong cyzwjjxt prairiekingarcadesystem",  // (BC)141 草原之王街机系统
+    "mutouhuoju mthj woodenbrazier",  // (BC)143 木头火炬
+    "shitouhuoju sthj stonebrazier",  // (BC)144 石头火炬
+    "jinzhihuoju jzhj goldbrazier",  // (BC)145 金制火炬
+    "gouhuo gh campfire",  // (BC)146 篝火
+    "shuzhuanghuoju szhj stumpbrazier",  // (BC)147 树桩火炬
+    "loukonghuoju lkhj carvedbrazier",  // (BC)148 镂空火炬
+    "kulouhuoju klhj skullbrazier",  // (BC)149 骷髅火炬
+    "mutonghuoju mthj barrelbrazier",  // (BC)150 木桶火炬
+    "dalishihuoju dlshj marblebrazier",  // (BC)151 大理石火炬
+    "mudengzhu mdz woodlamppost",  // (BC)152 木灯柱
+    "tiedengzhu tdz ironlamppost",  // (BC)153 铁灯柱
+    "chongerhe ceh wormbin",  // (BC)154 虫饵盒
+    "hmtgf",  // (BC)155 ??HMTGF??
+    "shilaimufuhuaqi slmfhq slimeincubator",  // (BC)156 史莱姆孵化器
+    "shilaimuyadanqi slmydq slimeeggpress",  // (BC)158 史莱姆压蛋器
+    "zhunimosaichejiejixitong znmscjjxt junimokartarcadesystem",  // (BC)159 祝尼魔赛车街机系统
+    "wanmeidiaoxiang wmdx statueofperfection",  // (BC)160 完美雕像
+    "fenseningmeng fsnm pinkylemon",  // (BC)161 ??粉色柠檬??
+    "suixiediaoxiang sxdx foroguemon",  // (BC)162 ??碎屑雕像??
+    "mutong mt cask",  // (BC)163 木桶
+    "liuyisihuangjinxiang lyshjx solidgoldlewis",  // (BC)164 刘易斯黄金像
+    "zidongcaijiqi zdcjq autograbber",  // (BC)165 自动采集器
+    "haohuadaocaoren hhdcr deluxescarecrow",  // (BC)167 豪华稻草人
+    "mutong mt barrel",  // (BC)174 木桶
+    "muxiang mx crate",  // (BC)175 木箱
+    "jijiexingzhiwu jjxzw seasonalplant",  // (BC)184 季节性植物
+    "jijiexingzhiwu jjxzw seasonalplant",  // (BC)188 季节性植物
+    "jijiexingzhiwu jjxzw seasonalplant",  // (BC)192 季节性植物
+    "jijiexingzhiwu jjxzw seasonalplant",  // (BC)196 季节性植物
+    "jijiexingzhiwu jjxzw seasonalplant",  // (BC)200 季节性植物
+    "jijiexingzhiwu jjxzw seasonalplant",  // (BC)204 季节性植物
+    "gongzuotai gzt workbench",  // (BC)208 工作台
+    "minidianchangji mndcj minijukebox",  // (BC)209 迷你点唱机
+    "suimuji smj woodchipper",  // (BC)211 碎木机
+    "dianhua dh telephone",  // (BC)214 电话
+    "minibingxiang mnbx minifridge",  // (BC)216 迷你冰箱
+    "beizuzhoudejiejixitongpk bzzdjjxt cursedpkarcadesystem",  // (BC)219 被诅咒的P.K.街机系统
+    "itempedestal",  // (BC)221 Item Pedestal
+    "shixiang sx stonechest",  // (BC)232 石箱
+    "minitutengjianta mnttjt miniobelisk",  // (BC)238 迷你图腾尖塔
+    "nongchangdiannao ncdn farmcomputer",  // (BC)239 农场电脑
+    "minichuhuoxiang mnchx minishippingbin",  // (BC)248 迷你出货箱
+    "tuoniaofuhuaqi tnfhq ostrichincubator",  // (BC)254 鸵鸟孵化器
+    "jingqiupokaiqi jqpkq geodecrusher",  // (BC)182 晶球破开器
+    "kafeiji kfj coffeemaker",  // (BC)246 咖啡机
+    "fengrenji frj sewingmachine",  // (BC)247 缝纫机
+    "taiyangnengban tynb solarpanel",  // (BC)231 太阳能板
+    "suiguji sgj bonemill",  // (BC)90 碎骨机
+    "zhunimoxiang znmx junimochest",  // (BC)256 祝尼魔箱
+    "mutong mt barrel",  // (BC)262 木桶
+    "muxiang mx crate",  // (BC)263 木箱
+    "zhongxingshuyecaijiqi zxsycjq heavytapper",  // (BC)264 重型树液采集器
+    "fenjieji fjj deconstructor",  // (BC)265 分解机
+    "zidongfumoji zdfmj autopetter",  // (BC)272 自动抚摸机
+    "jialiaoqi jlq hopper",  // (BC)275 加料器
+    "gouhuo gh campfire",  // (BC)278 篝火
+    "zhenzhengwanmeidediaoxiang zzwmddx statueoftrueperfection",  // (BC)280 真正完美的雕像
+    "wenzibiaopai wzbp textsign",  // (BC)TextSign 文字标牌
+    "mogushuzhuang mgsz mushroomlog",  // (BC)MushroomLog 蘑菇树桩
+    "yuerzhizaoji yezzj baitmaker",  // (BC)BaitMaker 鱼饵制造机
+    "hongganji hgj dehydrator",  // (BC)Dehydrator 烘干机
+    "zhongxingronglu zxrl heavyfurnace",  // (BC)HeavyFurnace 重型熔炉
+    "zhufudiaoxiang zfdx statueofblessings",  // (BC)StatueOfBlessings 祝福雕像
+    "airenzhiwangdiaoxiang arzwdx statueofthedwarfking",  // (BC)StatueOfTheDwarfKing 矮人之王雕像
+    "tiezhen tz anvil",  // (BC)Anvil 铁砧
+    "miniduanzaotai mndzt miniforge",  // (BC)MiniForge 迷你锻造台
+    "xunyuji xyj fishsmoker",  // (BC)FishSmoker 熏鱼机
+    "gaojichongerhe gjceh deluxewormbin",  // (BC)DeluxeWormBin 高级虫饵盒
+    "daxiangzi dxz bigchest",  // (BC)BigChest 大箱子
+    "shizhidaxiangzi szdxz bigstonechest",  // (BC)BigStoneChest 石制大箱子
+    "mofafajiao mffj magichairdye",  // (TR)MagicHairDye 魔法发胶
+    "qingwadan qwd frogegg",  // (TR)FrogEgg 青蛙蛋
+    "mofajiantong mfjt magicquiver",  // (TR)MagicQuiver 魔法箭筒
+    "xiannvhe xnh fairybox",  // (TR)FairyBox 仙女盒
+    "yingwudan ywd parrotegg",  // (TR)ParrotEgg 鹦鹉蛋
+    "hanbingfazhang hbfz icerod",  // (TR)IceRod 寒冰法杖
+    "huangjinmaci hjmc iridiumspur",  // (TR)IridiumSpur 黄金马刺
+    "xiguaidezhaozi xgdzz basiliskpaw",  // (TR)BasiliskPaw 蜥怪的爪子
+    "bizhi0 bz wallpaper",  // (WP)0 壁纸 0
+    "bizhi1 bz wallpaper",  // (WP)1 壁纸 1
+    "bizhi2 bz wallpaper",  // (WP)2 壁纸 2
+    "bizhi3 bz wallpaper",  // (WP)3 壁纸 3
+    "bizhi4 bz wallpaper",  // (WP)4 壁纸 4
+    "bizhi5 bz wallpaper",  // (WP)5 壁纸 5
+    "bizhi6 bz wallpaper",  // (WP)6 壁纸 6
+    "bizhi7 bz wallpaper",  // (WP)7 壁纸 7
+    "bizhi8 bz wallpaper",  // (WP)8 壁纸 8
+    "bizhi9 bz wallpaper",  // (WP)9 壁纸 9
+    "bizhi10 bz wallpaper",  // (WP)10 壁纸 10
+    "bizhi11 bz wallpaper",  // (WP)11 壁纸 11
+    "bizhi12 bz wallpaper",  // (WP)12 壁纸 12
+    "bizhi13 bz wallpaper",  // (WP)13 壁纸 13
+    "bizhi14 bz wallpaper",  // (WP)14 壁纸 14
+    "bizhi15 bz wallpaper",  // (WP)15 壁纸 15
+    "bizhi16 bz wallpaper",  // (WP)16 壁纸 16
+    "bizhi17 bz wallpaper",  // (WP)17 壁纸 17
+    "bizhi18 bz wallpaper",  // (WP)18 壁纸 18
+    "bizhi19 bz wallpaper",  // (WP)19 壁纸 19
+    "bizhi20 bz wallpaper",  // (WP)20 壁纸 20
+    "bizhi21 bz wallpaper",  // (WP)21 壁纸 21
+    "bizhi22 bz wallpaper",  // (WP)22 壁纸 22
+    "bizhi23 bz wallpaper",  // (WP)23 壁纸 23
+    "bizhi24 bz wallpaper",  // (WP)24 壁纸 24
+    "bizhi25 bz wallpaper",  // (WP)25 壁纸 25
+    "bizhi26 bz wallpaper",  // (WP)26 壁纸 26
+    "bizhi27 bz wallpaper",  // (WP)27 壁纸 27
+    "bizhi28 bz wallpaper",  // (WP)28 壁纸 28
+    "bizhi29 bz wallpaper",  // (WP)29 壁纸 29
+    "bizhi30 bz wallpaper",  // (WP)30 壁纸 30
+    "bizhi31 bz wallpaper",  // (WP)31 壁纸 31
+    "bizhi32 bz wallpaper",  // (WP)32 壁纸 32
+    "bizhi33 bz wallpaper",  // (WP)33 壁纸 33
+    "bizhi34 bz wallpaper",  // (WP)34 壁纸 34
+    "bizhi35 bz wallpaper",  // (WP)35 壁纸 35
+    "bizhi36 bz wallpaper",  // (WP)36 壁纸 36
+    "bizhi37 bz wallpaper",  // (WP)37 壁纸 37
+    "bizhi38 bz wallpaper",  // (WP)38 壁纸 38
+    "bizhi39 bz wallpaper",  // (WP)39 壁纸 39
+    "bizhi40 bz wallpaper",  // (WP)40 壁纸 40
+    "bizhi41 bz wallpaper",  // (WP)41 壁纸 41
+    "bizhi42 bz wallpaper",  // (WP)42 壁纸 42
+    "bizhi43 bz wallpaper",  // (WP)43 壁纸 43
+    "bizhi44 bz wallpaper",  // (WP)44 壁纸 44
+    "bizhi45 bz wallpaper",  // (WP)45 壁纸 45
+    "bizhi46 bz wallpaper",  // (WP)46 壁纸 46
+    "bizhi47 bz wallpaper",  // (WP)47 壁纸 47
+    "bizhi48 bz wallpaper",  // (WP)48 壁纸 48
+    "bizhi49 bz wallpaper",  // (WP)49 壁纸 49
+    "bizhi50 bz wallpaper",  // (WP)50 壁纸 50
+    "bizhi51 bz wallpaper",  // (WP)51 壁纸 51
+    "bizhi52 bz wallpaper",  // (WP)52 壁纸 52
+    "bizhi53 bz wallpaper",  // (WP)53 壁纸 53
+    "bizhi54 bz wallpaper",  // (WP)54 壁纸 54
+    "bizhi55 bz wallpaper",  // (WP)55 壁纸 55
+    "bizhi56 bz wallpaper",  // (WP)56 壁纸 56
+    "bizhi57 bz wallpaper",  // (WP)57 壁纸 57
+    "bizhi58 bz wallpaper",  // (WP)58 壁纸 58
+    "bizhi59 bz wallpaper",  // (WP)59 壁纸 59
+    "bizhi60 bz wallpaper",  // (WP)60 壁纸 60
+    "bizhi61 bz wallpaper",  // (WP)61 壁纸 61
+    "bizhi62 bz wallpaper",  // (WP)62 壁纸 62
+    "bizhi63 bz wallpaper",  // (WP)63 壁纸 63
+    "bizhi64 bz wallpaper",  // (WP)64 壁纸 64
+    "bizhi65 bz wallpaper",  // (WP)65 壁纸 65
+    "bizhi66 bz wallpaper",  // (WP)66 壁纸 66
+    "bizhi67 bz wallpaper",  // (WP)67 壁纸 67
+    "bizhi68 bz wallpaper",  // (WP)68 壁纸 68
+    "bizhi69 bz wallpaper",  // (WP)69 壁纸 69
+    "bizhi70 bz wallpaper",  // (WP)70 壁纸 70
+    "bizhi71 bz wallpaper",  // (WP)71 壁纸 71
+    "bizhi72 bz wallpaper",  // (WP)72 壁纸 72
+    "bizhi73 bz wallpaper",  // (WP)73 壁纸 73
+    "bizhi74 bz wallpaper",  // (WP)74 壁纸 74
+    "bizhi75 bz wallpaper",  // (WP)75 壁纸 75
+    "bizhi76 bz wallpaper",  // (WP)76 壁纸 76
+    "bizhi77 bz wallpaper",  // (WP)77 壁纸 77
+    "bizhi78 bz wallpaper",  // (WP)78 壁纸 78
+    "bizhi79 bz wallpaper",  // (WP)79 壁纸 79
+    "bizhi80 bz wallpaper",  // (WP)80 壁纸 80
+    "bizhi81 bz wallpaper",  // (WP)81 壁纸 81
+    "bizhi82 bz wallpaper",  // (WP)82 壁纸 82
+    "bizhi83 bz wallpaper",  // (WP)83 壁纸 83
+    "bizhi84 bz wallpaper",  // (WP)84 壁纸 84
+    "bizhi85 bz wallpaper",  // (WP)85 壁纸 85
+    "bizhi86 bz wallpaper",  // (WP)86 壁纸 86
+    "bizhi87 bz wallpaper",  // (WP)87 壁纸 87
+    "bizhi88 bz wallpaper",  // (WP)88 壁纸 88
+    "bizhi89 bz wallpaper",  // (WP)89 壁纸 89
+    "bizhi90 bz wallpaper",  // (WP)90 壁纸 90
+    "bizhi91 bz wallpaper",  // (WP)91 壁纸 91
+    "bizhi92 bz wallpaper",  // (WP)92 壁纸 92
+    "bizhi93 bz wallpaper",  // (WP)93 壁纸 93
+    "bizhi94 bz wallpaper",  // (WP)94 壁纸 94
+    "bizhi95 bz wallpaper",  // (WP)95 壁纸 95
+    "bizhi96 bz wallpaper",  // (WP)96 壁纸 96
+    "bizhi97 bz wallpaper",  // (WP)97 壁纸 97
+    "bizhi98 bz wallpaper",  // (WP)98 壁纸 98
+    "bizhi99 bz wallpaper",  // (WP)99 壁纸 99
+    "bizhi100 bz wallpaper",  // (WP)100 壁纸 100
+    "bizhi101 bz wallpaper",  // (WP)101 壁纸 101
+    "bizhi102 bz wallpaper",  // (WP)102 壁纸 102
+    "bizhi103 bz wallpaper",  // (WP)103 壁纸 103
+    "bizhi104 bz wallpaper",  // (WP)104 壁纸 104
+    "bizhi105 bz wallpaper",  // (WP)105 壁纸 105
+    "bizhi106 bz wallpaper",  // (WP)106 壁纸 106
+    "bizhi107 bz wallpaper",  // (WP)107 壁纸 107
+    "bizhi108 bz wallpaper",  // (WP)108 壁纸 108
+    "bizhi109 bz wallpaper",  // (WP)109 壁纸 109
+    "bizhi110 bz wallpaper",  // (WP)110 壁纸 110
+    "bizhi111 bz wallpaper",  // (WP)111 壁纸 111
+    "diban0 db flooring",  // (FL)0 地板 0
+    "diban1 db flooring",  // (FL)1 地板 1
+    "diban2 db flooring",  // (FL)2 地板 2
+    "diban3 db flooring",  // (FL)3 地板 3
+    "diban4 db flooring",  // (FL)4 地板 4
+    "diban5 db flooring",  // (FL)5 地板 5
+    "diban6 db flooring",  // (FL)6 地板 6
+    "diban7 db flooring",  // (FL)7 地板 7
+    "diban8 db flooring",  // (FL)8 地板 8
+    "diban9 db flooring",  // (FL)9 地板 9
+    "diban10 db flooring",  // (FL)10 地板 10
+    "diban11 db flooring",  // (FL)11 地板 11
+    "diban12 db flooring",  // (FL)12 地板 12
+    "diban13 db flooring",  // (FL)13 地板 13
+    "diban14 db flooring",  // (FL)14 地板 14
+    "diban15 db flooring",  // (FL)15 地板 15
+    "diban16 db flooring",  // (FL)16 地板 16
+    "diban17 db flooring",  // (FL)17 地板 17
+    "diban18 db flooring",  // (FL)18 地板 18
+    "diban19 db flooring",  // (FL)19 地板 19
+    "diban20 db flooring",  // (FL)20 地板 20
+    "diban21 db flooring",  // (FL)21 地板 21
+    "diban22 db flooring",  // (FL)22 地板 22
+    "diban23 db flooring",  // (FL)23 地板 23
+    "diban24 db flooring",  // (FL)24 地板 24
+    "diban25 db flooring",  // (FL)25 地板 25
+    "diban26 db flooring",  // (FL)26 地板 26
+    "diban27 db flooring",  // (FL)27 地板 27
+    "diban28 db flooring",  // (FL)28 地板 28
+    "diban29 db flooring",  // (FL)29 地板 29
+    "diban30 db flooring",  // (FL)30 地板 30
+    "diban31 db flooring",  // (FL)31 地板 31
+    "diban32 db flooring",  // (FL)32 地板 32
+    "diban33 db flooring",  // (FL)33 地板 33
+    "diban34 db flooring",  // (FL)34 地板 34
+    "diban35 db flooring",  // (FL)35 地板 35
+    "diban36 db flooring",  // (FL)36 地板 36
+    "diban37 db flooring",  // (FL)37 地板 37
+    "diban38 db flooring",  // (FL)38 地板 38
+    "diban39 db flooring",  // (FL)39 地板 39
+    "diban40 db flooring",  // (FL)40 地板 40
+    "diban41 db flooring",  // (FL)41 地板 41
+    "diban42 db flooring",  // (FL)42 地板 42
+    "diban43 db flooring",  // (FL)43 地板 43
+    "diban44 db flooring",  // (FL)44 地板 44
+    "diban45 db flooring",  // (FL)45 地板 45
+    "diban46 db flooring",  // (FL)46 地板 46
+    "diban47 db flooring",  // (FL)47 地板 47
+    "diban48 db flooring",  // (FL)48 地板 48
+    "diban49 db flooring",  // (FL)49 地板 49
+    "diban50 db flooring",  // (FL)50 地板 50
+    "diban51 db flooring",  // (FL)51 地板 51
+    "diban52 db flooring",  // (FL)52 地板 52
+    "diban53 db flooring",  // (FL)53 地板 53
+    "diban54 db flooring",  // (FL)54 地板 54
+    "diban55 db flooring",  // (FL)55 地板 55
+    "diban56 db flooring",  // (FL)56 地板 56
+    "diban57 db flooring",  // (FL)57 地板 57
+    "diban58 db flooring",  // (FL)58 地板 58
+    "diban59 db flooring",  // (FL)59 地板 59
+    "diban60 db flooring",  // (FL)60 地板 60
+    "diban61 db flooring",  // (FL)61 地板 61
+    "diban62 db flooring",  // (FL)62 地板 62
+    "diban63 db flooring",  // (FL)63 地板 63
+    "diban64 db flooring",  // (FL)64 地板 64
+    "diban65 db flooring",  // (FL)65 地板 65
+    "diban66 db flooring",  // (FL)66 地板 66
+    "diban67 db flooring",  // (FL)67 地板 67
+    "diban68 db flooring",  // (FL)68 地板 68
+    "diban69 db flooring",  // (FL)69 地板 69
+    "diban70 db flooring",  // (FL)70 地板 70
+    "diban71 db flooring",  // (FL)71 地板 71
+    "diban72 db flooring",  // (FL)72 地板 72
+    "diban73 db flooring",  // (FL)73 地板 73
+    "diban74 db flooring",  // (FL)74 地板 74
+    "diban75 db flooring",  // (FL)75 地板 75
+    "diban76 db flooring",  // (FL)76 地板 76
+    "diban77 db flooring",  // (FL)77 地板 77
+    "diban78 db flooring",  // (FL)78 地板 78
+    "diban79 db flooring",  // (FL)79 地板 79
+    "diban80 db flooring",  // (FL)80 地板 80
+    "diban81 db flooring",  // (FL)81 地板 81
+    "diban82 db flooring",  // (FL)82 地板 82
+    "diban83 db flooring",  // (FL)83 地板 83
+    "diban84 db flooring",  // (FL)84 地板 84
+    "diban85 db flooring",  // (FL)85 地板 85
+    "diban86 db flooring",  // (FL)86 地板 86
+    "diban87 db flooring",  // (FL)87 地板 87
+    "bizhimorewalls0 bz wallpaper",  // (WP)MoreWalls:0 壁纸 MoreWalls:0
+    "bizhimorewalls1 bz wallpaper",  // (WP)MoreWalls:1 壁纸 MoreWalls:1
+    "bizhimorewalls2 bz wallpaper",  // (WP)MoreWalls:2 壁纸 MoreWalls:2
+    "bizhimorewalls3 bz wallpaper",  // (WP)MoreWalls:3 壁纸 MoreWalls:3
+    "bizhimorewalls4 bz wallpaper",  // (WP)MoreWalls:4 壁纸 MoreWalls:4
+    "bizhimorewalls5 bz wallpaper",  // (WP)MoreWalls:5 壁纸 MoreWalls:5
+    "bizhimorewalls6 bz wallpaper",  // (WP)MoreWalls:6 壁纸 MoreWalls:6
+    "bizhimorewalls7 bz wallpaper",  // (WP)MoreWalls:7 壁纸 MoreWalls:7
+    "bizhimorewalls8 bz wallpaper",  // (WP)MoreWalls:8 壁纸 MoreWalls:8
+    "bizhimorewalls9 bz wallpaper",  // (WP)MoreWalls:9 壁纸 MoreWalls:9
+    "bizhimorewalls10 bz wallpaper",  // (WP)MoreWalls:10 壁纸 MoreWalls:10
+    "bizhimorewalls11 bz wallpaper",  // (WP)MoreWalls:11 壁纸 MoreWalls:11
+    "bizhimorewalls12 bz wallpaper",  // (WP)MoreWalls:12 壁纸 MoreWalls:12
+    "bizhimorewalls13 bz wallpaper",  // (WP)MoreWalls:13 壁纸 MoreWalls:13
+    "bizhimorewalls14 bz wallpaper",  // (WP)MoreWalls:14 壁纸 MoreWalls:14
+    "bizhimorewalls15 bz wallpaper",  // (WP)MoreWalls:15 壁纸 MoreWalls:15
+    "bizhimorewalls16 bz wallpaper",  // (WP)MoreWalls:16 壁纸 MoreWalls:16
+    "bizhimorewalls17 bz wallpaper",  // (WP)MoreWalls:17 壁纸 MoreWalls:17
+    "bizhimorewalls18 bz wallpaper",  // (WP)MoreWalls:18 壁纸 MoreWalls:18
+    "bizhimorewalls19 bz wallpaper",  // (WP)MoreWalls:19 壁纸 MoreWalls:19
+    "bizhimorewalls20 bz wallpaper",  // (WP)MoreWalls:20 壁纸 MoreWalls:20
+    "bizhimorewalls21 bz wallpaper",  // (WP)MoreWalls:21 壁纸 MoreWalls:21
+    "bizhimorewalls22 bz wallpaper",  // (WP)MoreWalls:22 壁纸 MoreWalls:22
+    "bizhimorewalls23 bz wallpaper",  // (WP)MoreWalls:23 壁纸 MoreWalls:23
+    "bizhimorewalls24 bz wallpaper",  // (WP)MoreWalls:24 壁纸 MoreWalls:24
+    "bizhimorewalls25 bz wallpaper",  // (WP)MoreWalls:25 壁纸 MoreWalls:25
+    "dibanmorefloors0 db flooring",  // (FL)MoreFloors:0 地板 MoreFloors:0
+    "dibanmorefloors1 db flooring",  // (FL)MoreFloors:1 地板 MoreFloors:1
+    "dibanmorefloors2 db flooring",  // (FL)MoreFloors:2 地板 MoreFloors:2
+    "dibanmorefloors3 db flooring",  // (FL)MoreFloors:3 地板 MoreFloors:3
+    "dibanmorefloors4 db flooring",  // (FL)MoreFloors:4 地板 MoreFloors:4
+    "dibanmorefloors5 db flooring",  // (FL)MoreFloors:5 地板 MoreFloors:5
+    "dibanmorefloors6 db flooring",  // (FL)MoreFloors:6 地板 MoreFloors:6
+    "dibanmorefloors7 db flooring",  // (FL)MoreFloors:7 地板 MoreFloors:7
+    "dibanmorefloors8 db flooring",  // (FL)MoreFloors:8 地板 MoreFloors:8
+    "futou ft axe",  // (T)Axe 斧头
+    "tongfutou tft copperaxe",  // (T)CopperAxe 铜斧头
+    "gangfutou gft steelaxe",  // (T)SteelAxe 钢斧头
+    "jinfutou jft goldaxe",  // (T)GoldAxe 金斧头
+    "yifutou yft iridiumaxe",  // (T)IridiumAxe 铱斧头
+    "zhuyugan zyg bamboopole",  // (T)BambooPole 竹鱼竿
+    "xunlianyongyugan xlyyg trainingrod",  // (T)TrainingRod 训练用鱼竿
+    "bolixianweibang blxwb fiberglassrod",  // (T)FiberglassRod 玻璃纤维棒
+    "yijinyugan yjyg iridiumrod",  // (T)IridiumRod 铱金鱼竿
+    "gaojiyijinyugan gjyjyg advancediridiumrod",  // (T)AdvancedIridiumRod 高级铱金鱼竿
+    "chutou ct hoe",  // (T)Hoe 锄头
+    "tongchutou tct copperhoe",  // (T)CopperHoe 铜锄头
+    "gangchutou gct steelhoe",  // (T)SteelHoe 钢锄头
+    "jinchutou jct goldhoe",  // (T)GoldHoe 金锄头
+    "yichutou yct iridiumhoe",  // (T)IridiumHoe 铱锄头
+    "denglong dl lantern",  // (T)Lantern 灯笼
+    "jinaitong jnt milkpail",  // (T)MilkPail 挤奶桶
+    "tongtaopan ttp pan",  // (T)Pan 铜淘盘
+    "gangtaopan gtp steelpan",  // (T)SteelPan 钢淘盘
+    "jintaopan jtp goldpan",  // (T)GoldPan 金淘盘
+    "yitaopan ytp iridiumpan",  // (T)IridiumPan 铱淘盘
+    "shizigao szg pickaxe",  // (T)Pickaxe 十字镐
+    "tongshizigao tszg copperpickaxe",  // (T)CopperPickaxe 铜十字镐
+    "gangshizigao gszg steelpickaxe",  // (T)SteelPickaxe 钢十字镐
+    "jinshizigao jszg goldpickaxe",  // (T)GoldPickaxe 金十字镐
+    "yishizigao yszg iridiumpickaxe",  // (T)IridiumPickaxe 铱十字镐
+    "huichengmozhang hcmz returnscepter",  // (T)ReturnScepter 回程魔杖
+    "jiandao jd shears",  // (T)Shears 剪刀
+    "penhu ph wateringcan",  // (T)WateringCan 喷壶
+    "tongpenhu tph copperwateringcan",  // (T)CopperWateringCan 铜喷壶
+    "gangpenhu gph steelwateringcan",  // (T)SteelWateringCan 钢喷壶
+    "jinpenhu jph goldwateringcan",  // (T)GoldWateringCan 金喷壶
+    "yipenhu yph iridiumwateringcan",  // (T)IridiumWateringCan 铱喷壶
+    "tonglajitong tljt coppertrashcan",  // (T)CopperTrashCan 铜垃圾桶
+    "ganglajitong gljt steeltrashcan",  // (T)SteelTrashCan 钢垃圾桶
+    "jinlajitong jljt goldtrashcan",  // (T)GoldTrashCan 金垃圾桶
+    "yilajitong yljt iridiumtrashcan",  // (T)IridiumTrashCan 铱垃圾桶
 };
 
 constexpr int kSearchKeyCount = sizeof(kSearchKeys) / sizeof(kSearchKeys[0]);
