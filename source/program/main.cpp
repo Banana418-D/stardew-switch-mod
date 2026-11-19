@@ -767,7 +767,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 658;
+    constexpr int kBuildNo = 659;
 
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
@@ -2855,6 +2855,31 @@ namespace {
      *                  inside a draw hook. */
     static const bool kDiagNoStr  = false;
     static const bool kDiagNoDraw = false;
+
+    /* v659: "is a world loaded, menu or no menu?"  The draw-side twin of
+     * GameWorldRunning().
+     *
+     * GameWorldRunning() answers false while ANY menu is open (menuNow != null),
+     * and the update hook clears s_worldAlive on every such frame.  The map
+     * page IS a menu -- so the v640 gates below ("s_worldAlive == 0 -> bail")
+     * fired on every frame the map was actually on screen, and the whole map
+     * enhancement (NPC avatars, the player marker, the hover list, the v554
+     * ginger-island region filter) silently died.  Same class of bug as the
+     * two gates v656 removed.
+     *
+     * This predicate keeps the v640 protection but asks the right question:
+     * bail only when there is genuinely no world -- the title screen
+     * (g_titleMode latched, v643) or no current location.  SafeCurrentLocation()
+     * is fully range-checked and returns null before a save exists, which is
+     * the cold-boot path hardware has proven safe.  While a map page exists a
+     * menu is open, and in that state a location always does. */
+    bool WorldLoadedForDraw() {
+        if (g_base == 0 || g_titleMode != 0) {
+            return false;
+        }
+        return SafeCurrentLocation() != nullptr;
+    }
+
     /* kDiagNoAnim -- HookCheckSingleAnimation calls the original once and
      * returns.  Turning the 2x checkbox off does NOT test this properly: the
      * hook still runs on every animated sprite every frame, still does the
@@ -2876,7 +2901,11 @@ namespace {
         s_origDrawPortrait(who, index, x, y);
         /* v637: s_mapPage is read right below with no readability check, and it
          * can be left pointing at a destroyed maps page. */
-        if (s_worldAlive == 0 || kDiagNoDraw) {
+        /* v659: s_worldAlive is 0 while ANY menu is open (the update hook owns
+         * it) -- and the map page IS a menu, so this gate fired on every frame
+         * the player marker should have been drawn.  Ask WorldLoadedForDraw()
+         * instead: false only at the title screen or before a save. */
+        if (!WorldLoadedForDraw() || kDiagNoDraw) {
             return;
         }
 
@@ -3547,7 +3576,13 @@ namespace {
          * the save is closed this hook still runs once (the log showed
          * `hit: miniport` there), and s_mapPage was left pointing at the page
          * that had just been destroyed. */
-        if (s_worldAlive == 0) {
+        /* v659: the gate asked s_worldAlive, which the update hook clears for
+         * ANY menu -- and the map page IS a menu, so this fired on every frame
+         * the map was actually open: no avatars, no hover list, no birthday
+         * marker, the v554 ginger-island filter gone.  WorldLoadedForDraw()
+         * keeps the v640 protection (bail at the title screen / no save) but
+         * lets the enhancement run while a menu holds the world. */
+        if (!WorldLoadedForDraw()) {
             s_mapPage = nullptr;
             if (s_origDrawMini != nullptr) {
                 s_origDrawMini(self, batch, alpha);
@@ -24237,6 +24272,14 @@ namespace {
             return;
         }
         StMark("u0");
+        /* v659: no menu open -> no map page exists.  The draw hooks used to
+         * rely on s_worldAlive clearing s_mapPage here, but from v659 on they
+         * run while a menu holds the world, so the menu-open frames no longer
+         * reach this gate.  Clearing on "world AND no menu" keeps s_mapPage
+         * from outliving the page the moment the map closes back into play. */
+        if (menuNow == nullptr) {
+            s_mapPage = nullptr;
+        }
         DiagRightStick();
         StMark("u1-diag");
         SuppressStickMenus();
