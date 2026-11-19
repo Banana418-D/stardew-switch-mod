@@ -10,7 +10,7 @@
 **遇到问题请提 issue（附日志，见下）**，或者直接联系我：
 
 - GitHub：<https://github.com/Banana418-D>（仓库：`Banana418-D/stardew-switch-mod`）
-- 邮箱：**lisooreal@163.com**
+- 邮箱：**lisooreal0202@gmail.com**
 
 发在其他非官方渠道的反馈，作者不一定看得到，也不一定能跟进。
 
